@@ -11,6 +11,7 @@ type Session = any;
 const NAV = [
   { key: 'overview', label: '平台总览', icon: '📊' },
   { key: 'ledger', label: '分账监管', icon: '💰' },
+  { key: 'reversals', label: '冲正与退款', icon: '↩️' },
   { key: 'orders', label: '订单追溯', icon: '🧾' },
   { key: 'dispatch', label: '调度总览', icon: '🌙' },
   { key: 'coupons', label: '补偿券发放', icon: '🎫' },
@@ -22,6 +23,7 @@ export function AdminWorkspace({ session }: { session: Session }) {
     <WorkspaceShell session={session} nav={NAV} active={tab} onNav={setTab}>
       {tab === 'overview' && <OverviewTab go={setTab} />}
       {tab === 'ledger' && <LedgerTab />}
+      {tab === 'reversals' && <ReversalsTab />}
       {tab === 'orders' && <OrdersTab />}
       {tab === 'dispatch' && <DispatchTab />}
       {tab === 'coupons' && <CouponTab />}
@@ -130,7 +132,11 @@ function LedgerTab() {
                   <td className="small mono">{l.settlement_code}<div className="small muted">{l.reservation_code}</div></td>
                   <td className="mono">{l.spot_code}</td>
                   <td>{accountLabel(l.account)}</td>
-                  <td><Tag cls={l.direction === 'debit' ? 'amber' : 'green'} label={l.direction === 'debit' ? '借' : '贷'} /></td>
+                  <td>
+                    <Tag cls={l.direction === 'debit' ? 'amber' : 'green'} label={l.direction === 'debit' ? '借' : '贷'} />
+                    {l.reversal_id != null && <Tag cls="red" label="冲正" />}
+                    {l.refund_request_id != null && <Tag cls="cyan" label="退款单" />}
+                  </td>
                   <td className="money">{money(l.amount)}</td>
                   <td className="small">{l.memo}</td>
                 </tr>
@@ -151,6 +157,76 @@ function OrdersTab() {
       <PageHead title="全量停车服务单" desc="任意角色的订单追溯入口：发布 → 预约 → 入场 → 异常 → 离场 → 分账" />
       <div className="card"><OrderTable orders={orders ?? []} onOpen={setDetail} /></div>
       {detail && <ReservationDetailModal id={detail} onClose={() => setDetail(null)} />}
+    </div>
+  );
+}
+
+// ---------- 冲正单与退款监管 ----------
+function ReversalsTab() {
+  const { data: reversals } = useLoader<any[]>('/reversals');
+  const { data: refunds } = useLoader<any[]>('/refund-requests');
+  const approved = (refunds ?? []).filter((f) => f.status === 'approved');
+  const refundedTotal = approved.reduce((a, f) => a + Number(f.validated_amount), 0);
+
+  return (
+    <div>
+      <PageHead title="冲正单与退款监管" desc="财务结算后申诉成立的冲正单（红冲原分账并关联新分账），以及经道闸/巡查/离场时间校验的退款审批" />
+      <div className="grid grid-3" style={{ marginBottom: 16 }}>
+        <div className="stat"><div className="label">冲正单</div><div className="value">{reversals?.length ?? 0}</div><div className="sub">申诉成立后红冲原分账</div></div>
+        <div className="stat"><div className="label">退款申请</div><div className="value">{refunds?.length ?? 0}</div><div className="sub">待审 {(refunds ?? []).filter((f) => f.status === 'pending').length} 笔</div></div>
+        <div className="stat"><div className="label">已核准退款</div><div className="value" style={{ fontSize: 20 }}>{money(refundedTotal)}</div><div className="sub">重复冲销校验拦截超额部分</div></div>
+      </div>
+      <div className="card">
+        <h3>冲正单（红冲档案）</h3>
+        {(reversals ?? []).length === 0 && <div className="empty">暂无冲正单</div>}
+        {(reversals ?? []).length > 0 && (
+          <div className="table-wrap">
+            <table>
+              <thead><tr><th>冲正单</th><th>原分账（已红冲）</th><th>新分账</th><th>关联申诉</th><th>原因</th><th>操作人</th><th>时间</th></tr></thead>
+              <tbody>
+                {(reversals ?? []).map((rv) => (
+                  <tr key={rv.id}>
+                    <td className="mono small">{rv.code}</td>
+                    <td className="mono small">{rv.settlement_code}<div className="small muted">{rv.reservation_code} · {rv.spot_code}</div></td>
+                    <td className="mono small">{rv.new_settlement_code ?? '—'}</td>
+                    <td className="small mono">{rv.appeal_code ?? '—'}<div className="small muted">{rv.ruling ?? ''}</div></td>
+                    <td className="small" style={{ maxWidth: 280 }}>{rv.reason}</td>
+                    <td className="small">{rv.created_by_name ?? '—'}</td>
+                    <td className="small muted">{dt(rv.created_at)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+      <div className="card">
+        <h3>退款审批记录</h3>
+        {(refunds ?? []).length === 0 && <div className="empty">暂无退款申请</div>}
+        {(refunds ?? []).length > 0 && (
+          <div className="table-wrap">
+            <table>
+              <thead><tr><th>退款单</th><th>车主/订单</th><th>申请金额</th><th>核准金额</th><th>状态</th><th>重复冲销校验</th><th>时间</th></tr></thead>
+              <tbody>
+                {(refunds ?? []).map((f) => {
+                  const dup = (f.checks ?? []).find((c: any) => c.key === 'duplicate');
+                  return (
+                    <tr key={f.id}>
+                      <td className="mono small">{f.code}</td>
+                      <td className="small">{f.driver_name}<div className="small muted mono">{f.reservation_code} · {f.spot_code}</div></td>
+                      <td className="money">{money(f.requested_amount)}</td>
+                      <td className="money">{f.status === 'approved' ? money(f.validated_amount) : '—'}</td>
+                      <td><Tag status={f.status} /></td>
+                      <td className="small" style={{ maxWidth: 300 }}>{dup?.detail ?? '—'}</td>
+                      <td className="small muted">{dt(f.created_at)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

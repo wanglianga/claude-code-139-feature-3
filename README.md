@@ -124,30 +124,54 @@ npm run dev
 - 陌生车占用：服务费全免，平台**先行赔付**车主 20 元与业主 30 元，挂账向陌生车主追缴，不影响预约车主信用；
 - 平台/物业责任或信号差：费用全免、预付退还，并发放非现金赔付券。
 
+### 跨日分账与退款校验（`src/domain/daySplit.ts` / `src/domain/refund.ts`，纯函数）
+- **跨日分账**：车辆凌晨离场、订单跨越两个结算日时，按实际占用时段（`usableFrom → 计费截止`）以 00:00 为界
+  拆分到每个结算日：基础停车费按分钟占比分摊（末段吸收舍入，合计守恒），充电费按充电结算时点归属，
+  超时费按超时区间归属；每段独立计提业主收益 70% / 物业服务费 10% / 平台 20%，落库 `settlement_day_segments`。
+- **每段费用来源**：时段内发生的**换位调度**（物业 `POST /dispatch/spot-swap` 把进行中订单协调至相邻车位，
+  订单延续不换单）、**优惠券抵扣**、**物业人工放行**、业主回家、陌生车占用、信号差、错停核验、充电服务，
+  按发生时间归属到对应结算日段，财务页（订单分账清算 / 管理员分账监管）逐段展示。
+- **退款校验**：车主对已结算订单申请退款（`POST /reservations/:id/refund-requests`），平台按
+  **道闸记录**（无入场记录则服务未交付）、**物业巡查**（巡查发现车位被占用则应付清零）、
+  **离场时间**（提前离场不多计、申诉终裁免单口径）校验可退金额；
+  可退上限 = 实收 − 已退（结算退款 + 已批准退款单）− 校验后应付，**超额自动截断、余额为 0 直接拦截**，
+  避免重复冲销；物业/管理员审批（`POST /refund-requests/:id/review`）时事务内重新校验，
+  批准后生成 托管 → 车主 退款流水。重算分账时，退款单已退金额从应退中扣减，不再重复退款。
+- **冲正单**：财务结算后申诉成立，终裁重算（`POST /appeals/:id/resettle`）不再删除原分账，
+  而是生成**冲正单**（`settlement_reversals`，RV 单号）关联原分账与申诉：原分账逐笔红冲反向流水
+  （`冲正：` 前缀，全局借贷仍平衡）、标记 `status='reversed'` 保留档案，再按终裁生成新分账并回写关联；
+  管理员"冲正与退款"页与订单分账页均可追溯 原分账 ↔ 新分账 ↔ 申诉 的完整链路。
+
 ### 单车位一晚多订单时间轴（`src/domain/timeline.ts`）
 同一车位同一晚存在多笔预约时，时间轴按所有入场/离场/异常分界点切成互不重叠的时间段，
 每段明确解释：**谁在使用、谁付款、谁承担违约**（正常使用/访客超时/等待受阻/业主自用/陌生车占用/空档）。
 
 ### 共同追溯
-每张服务单可查看完整事件流、关联异常工单、挪车通知、申诉档案、分账清算单与资金流水；
-管理员可跨账户审计全平台流水并实时校验"借贷平衡"。
+每张服务单可查看完整事件流、关联异常工单、挪车通知、申诉档案、分账清算单（含跨日分日段与每段费用来源）、
+退款申请记录与资金流水；管理员可跨账户审计全平台流水并实时校验"借贷平衡"，
+并在"冲正与退款"页追溯 冲正单 ↔ 原分账 ↔ 新分账 ↔ 申诉 的完整链路；
+车主在"退款申请"页发起退款并查看道闸/巡查/离场时间/重复冲销四项校验明细，物业在"退款审核"页按校验上限核准或驳回。
 
 ---
 
 ## 五、本题的验证方式与结果（均已实际执行）
 
-### 后端单元测试（Jest，19 个用例全部通过）
+### 后端单元测试（Jest，36 个用例全部通过）
 ```bash
 cd backend && npm test
 ```
-- `test/pricing.spec.ts`（10 个）：夜间封顶、充电费、访客超时 1.5× 与信用 -3、业主回家实际时长计费+补偿+退款、
+- `test/pricing.spec.ts`（11 个）：夜间封顶、充电费、访客超时 1.5× 与信用 -3、业主回家实际时长计费+补偿+退款、
   车主错停违约金/业主补偿/信用 -10、陌生车平台兜底、优惠券封顶、70/10/20 分成、平台全责全额退款、
-  **四种裁决场景下资金流水借贷平衡**。
+  **退款单已退金额不再重复退款且流水平衡**、四种裁决场景下资金流水借贷平衡。
 - `test/adjudication.spec.ts`（6 个）：车主错停、业主回家责任、陌生车+人工放行、识别失败+信号差平台责任、
   证据不足不作自动处罚、证据时间线排序。
 - `test/timeline.spec.ts`（3 个）：一晚相邻两单归属、陌生车占用段平台兜底/追缴归责、业主回家段业主自用与担责。
+- `test/daySplit.spec.ts`（8 个）：跨日区间 00:00 切段、按分钟占比拆分业主/物业/平台且合计守恒、
+  充电费按结算时点归属、超时费归属离场日、费用来源按发生时间归段、免单 0 分钟段承载来源。
+- `test/refund.spec.ts`（8 个）：可退上限=实付−已退−校验后应付、提前离场余额可退、超额截断、
+  道闸无入场记录全退、巡查发现占用应付清零、裁决免单、**重复冲销防护（二次申请余额为 0 自动拒绝）**、部分已退仅退差额。
 
-### 真实数据库 + HTTP 端到端冒烟（53 项断言全部通过）
+### 真实数据库 + HTTP 端到端冒烟（82 项断言全部通过）
 对运行中的 NestJS（真实 PostgreSQL）执行 `node backend/seed/smoke.mjs`，用道闸时钟参数把事件锚定到"今晚"时间线，端到端覆盖：
 
 1. 四角色登录、业主发布 4 个车位、物业审核、车主按充电桩筛选；
@@ -160,9 +184,19 @@ cd backend && npm test
    **终裁后重算分账借贷仍平衡**、业主信用 -5；
 6. 订单 D：夜巡发现陌生车占用充电位 → 时间轴标注占用段（预约车主不计费/平台兜底/向陌生车主追缴）→
    判陌生车责任 → 服务费全免、平台垫付车主 20+业主 30、不影响预约车主信用；
-7. 共同追溯：全账户资金流水（含托管账户/券池）、调度总览、单订单全链路事件、六类证据档案、巡查照片留档。
+7. 共同追溯：全账户资金流水（含托管账户/券池）、调度总览、单订单全链路事件、六类证据档案、巡查照片留档；
+8. **订单 E（跨日分账）**：今日 22:00 → 次日 02:00 凌晨离场，结算拆分为两个结算日段
+   （22:10→24:00 共 110 分钟 / 00:00→02:00 共 120 分钟），各段基础费/充电费/业主收益/物业费合计与结算单守恒，
+   充电费 12 元归属次日段，首日段费用来源含优惠券+物业人工放行、次日段含充电服务，结算单标记 `cross_day`；
+9. **订单 F（换位调度）**：进行中订单由物业换位至相邻车位，订单延续不换单，
+   财务段费用来源展示"换位调度：原车位 → 新车位"，生成已处置换位工单；
+10. **退款校验**：正常缴费订单退款被拦截（可退余额 0）；订单 G 结算后申诉终裁平台责任，
+    退款校验给出道闸/巡查/离场时间/重复冲销四项明细，可退上限 = 实付 20 − 已退 0.42 = 19.58 元，
+    申请 20 元超额部分自动截断按 19.58 元核准，托管 → 车主流水借贷平衡，**同一订单重复退款被重复冲销校验拦截**；
+11. **冲正单**：订单 G 重算生成冲正单 RV 关联原分账与新分账，新分账不再重复退款（仅补退被红冲的 0.42 元），
+    原分账档案保留并附 `冲正：` 红冲流水，红冲后全平台流水借贷仍平衡，冲正单可溯源申诉。
 
-最近一次执行输出：`RESULT: 53 passed, 0 failed` / `SMOKE_OK`。
+最近一次执行输出：`RESULT: 82 passed, 0 failed` / `SMOKE_OK`。
 
 ### 前端验证
 - `cd frontend && npm run build`：TypeScript 类型检查 + Vite 生产构建通过（40 个模块）；
@@ -183,9 +217,11 @@ cd backend && npm test
 | 预约 | `POST /reservations` `GET /reservations` `GET /reservations/:id` `POST /reservations/:id/cancel` | 车主 |
 | 道闸·导航 | `POST /operations/gate/recognize` `POST /operations/gate/admit` `POST /operations/navigation/guidance` `POST /operations/reservations/:id/parked` `POST /operations/reservations/:id/report-signal` | 物业/车主 |
 | 巡查 | `GET/POST /operations/patrol` | 物业 |
-| 调度 | `GET /dispatch/incidents` `POST /dispatch/owner-return` `POST /dispatch/overstay` `POST /dispatch/incidents/:id/notify` `POST /dispatch/incidents/:id/resolve` `GET /dispatch/overview` | 业主/物业 |
+| 调度 | `GET /dispatch/incidents` `POST /dispatch/owner-return` `POST /dispatch/overstay` `POST /dispatch/spot-swap` `POST /dispatch/incidents/:id/notify` `POST /dispatch/incidents/:id/resolve` `GET /dispatch/overview` | 业主/物业 |
 | 申诉 | `POST /appeals` `GET /appeals` `GET /appeals/:id` `POST /appeals/:id/evidence` `POST /appeals/:id/rule` `POST /appeals/:id/resettle` | 车主/物业 |
 | 分账 | `POST /reservations/:id/exit` `GET /reservations/:id/quote` `GET /reservations/:id/settlement` `GET /ledger` `GET /spots/:id/timeline` | 按角色 |
+| 退款 | `POST /reservations/:id/refund-requests` `GET /refund-requests` `POST /refund-requests/:id/review` | 车主申请/物业·管理员审批 |
+| 冲正 | `GET /reversals`（申诉成立重算时自动生成 RV 冲正单） | 按角色 |
 
 支持道闸时钟校准参数 `entry_at` / `parked_at` / `exit_at` / `occurred_at` / `resolved_at` / `patrolled_at`
 （现场设备补录、夜间订单复盘使用），时间轴支持 `?date=YYYY-MM-DD`（当晚 18:00~次日 09:00）或 `?start=&end=` 任意审计窗口。
@@ -197,14 +233,14 @@ cd backend && npm test
 ├── docker-compose.yml          # 一键启动 db + backend + frontend
 ├── backend/
 │   ├── src/
-│   │   ├── domain/             # pricing 计费分账 / adjudication 证据裁决 / timeline 时间轴 / availability 时段
-│   │   ├── database/           # pg 连接池 + schema.sql（15 张表）
+│   │   ├── domain/             # pricing 计费分账 / daySplit 跨日分账 / refund 退款校验 / adjudication 证据裁决 / timeline 时间轴 / availability 时段
+│   │   ├── database/           # pg 连接池 + schema.sql（18 张表：新增 分日段/退款单/冲正单）
 │   │   ├── auth/ spots/ reservations/ operations/ dispatch/ appeals/ settlement/
-│   ├── test/                   # 19 个 Jest 单元测试
-│   └── seed/seed.js + smoke.mjs  # 种子数据 + 53 项端到端冒烟
+│   ├── test/                   # 36 个 Jest 单元测试
+│   └── seed/seed.js + smoke.mjs  # 种子数据 + 82 项端到端冒烟
 └── frontend/
     └── src/
         ├── App.tsx             # 登录 + 四角色路由
         ├── pages/              # owner / driver / property / admin 工作台 + 共享弹层
-        └── components.tsx      # 分账明细、资金流水、整晚时间轴、证据链、事件流
+        └── components.tsx      # 分账明细、跨日分日段、资金流水、整晚时间轴、证据链、事件流
 ```

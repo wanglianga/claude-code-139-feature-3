@@ -181,7 +181,7 @@ CREATE TABLE IF NOT EXISTS coupons (
 CREATE TABLE IF NOT EXISTS settlements (
   id BIGSERIAL PRIMARY KEY,
   code TEXT UNIQUE NOT NULL,
-  reservation_id BIGINT UNIQUE NOT NULL REFERENCES reservations(id),
+  reservation_id BIGINT NOT NULL REFERENCES reservations(id),
   spot_id BIGINT NOT NULL REFERENCES parking_spots(id),
   actual_entry_at TIMESTAMPTZ,
   actual_exit_at TIMESTAMPTZ,
@@ -235,5 +235,72 @@ CREATE TABLE IF NOT EXISTS patrol_logs (
   patrolled_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- 跨日分账：订单凌晨离场跨越两个结算日时，按实际占用时段拆分到每个结算日
+CREATE TABLE IF NOT EXISTS settlement_day_segments (
+  id BIGSERIAL PRIMARY KEY,
+  settlement_id BIGINT NOT NULL REFERENCES settlements(id) ON DELETE CASCADE,
+  settlement_date DATE NOT NULL,        -- 结算日（自然日）
+  from_at TIMESTAMPTZ NOT NULL,
+  to_at TIMESTAMPTZ NOT NULL,
+  minutes INT NOT NULL DEFAULT 0,
+  base_fee NUMERIC(10,2) NOT NULL DEFAULT 0,
+  charging_fee NUMERIC(10,2) NOT NULL DEFAULT 0,
+  overtime_fee NUMERIC(10,2) NOT NULL DEFAULT 0,
+  service_revenue NUMERIC(10,2) NOT NULL DEFAULT 0,
+  owner_income NUMERIC(10,2) NOT NULL DEFAULT 0,
+  property_fee NUMERIC(10,2) NOT NULL DEFAULT 0,
+  platform_fee NUMERIC(10,2) NOT NULL DEFAULT 0,
+  sources JSONB NOT NULL DEFAULT '[]'::jsonb,  -- 每段费用来源（换位/优惠券/人工放行…）
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_segments_settlement ON settlement_day_segments(settlement_id);
+CREATE INDEX IF NOT EXISTS idx_segments_date ON settlement_day_segments(settlement_date);
+
+-- 车主退款申请：按道闸/巡查/离场时间校验可退金额，避免重复冲销
+CREATE TABLE IF NOT EXISTS refund_requests (
+  id BIGSERIAL PRIMARY KEY,
+  code TEXT UNIQUE NOT NULL,
+  reservation_id BIGINT NOT NULL REFERENCES reservations(id),
+  settlement_id BIGINT REFERENCES settlements(id),
+  driver_id BIGINT NOT NULL REFERENCES users(id),
+  requested_amount NUMERIC(10,2) NOT NULL,
+  reason TEXT,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected')),
+  validated_amount NUMERIC(10,2),        -- 系统校验后的可退金额
+  checks JSONB NOT NULL DEFAULT '[]'::jsonb, -- 校验明细（道闸/巡查/离场时间/重复冲销）
+  review_note TEXT,
+  reviewed_by BIGINT REFERENCES users(id),
+  reviewed_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_refund_reservation ON refund_requests(reservation_id);
+
+-- 冲正单：财务结算后申诉成立，红冲原分账并关联重算后的新分账
+CREATE TABLE IF NOT EXISTS settlement_reversals (
+  id BIGSERIAL PRIMARY KEY,
+  code TEXT UNIQUE NOT NULL,
+  settlement_id BIGINT NOT NULL REFERENCES settlements(id),      -- 被冲正的原分账
+  new_settlement_id BIGINT REFERENCES settlements(id),           -- 重算后的新分账
+  appeal_id BIGINT REFERENCES appeals(id),
+  reason TEXT,
+  created_by BIGINT REFERENCES users(id),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- 幂等迁移：为旧版本库补充后续新增列
 ALTER TABLE settlements ADD COLUMN IF NOT EXISTS coupon_compensation NUMERIC(10,2) NOT NULL DEFAULT 0;
+ALTER TABLE settlements ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active';
+-- 幂等迁移：原 reservation_id 唯一约束改为"每单仅一条有效(active)分账"的部分唯一索引，
+-- 使申诉成立后的冲正单能保留原分账档案（status='reversed'）
+ALTER TABLE settlements DROP CONSTRAINT IF EXISTS settlements_reservation_id_key;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_settlements_one_active ON settlements(reservation_id) WHERE status='active';
+ALTER TABLE ledger_entries ADD COLUMN IF NOT EXISTS reversal_id BIGINT REFERENCES settlement_reversals(id);
+ALTER TABLE ledger_entries ADD COLUMN IF NOT EXISTS refund_request_id BIGINT REFERENCES refund_requests(id);
+
+-- 幂等迁移：工单类型增加"换位调度 spot_swap"
+ALTER TABLE incident_tickets DROP CONSTRAINT IF EXISTS incident_tickets_type_check;
+ALTER TABLE incident_tickets ADD CONSTRAINT incident_tickets_type_check
+  CHECK (type IN (
+    'owner_return','visitor_overstay','stranger_occupy','recognition_fail',
+    'weak_signal','ice_occupy_charger','wrong_parking','manual_release','spot_swap'
+  ));

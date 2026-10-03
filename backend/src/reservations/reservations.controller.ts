@@ -227,10 +227,14 @@ export class ReservationsController {
     );
     const appeals = await this.db.query(`SELECT * FROM appeals WHERE reservation_id=$1 ORDER BY id`, [id]);
     const settlement = await this.db.query(
-      `SELECT * FROM settlements WHERE reservation_id=$1`,
+      `SELECT * FROM settlements WHERE reservation_id=$1 AND status='active' ORDER BY id DESC LIMIT 1`,
       [id],
     );
-    return { ...r, events: events.rows, incidents: incidents.rows, appeals: appeals.rows, settlement: settlement.rows[0] ?? null };
+    const refunds = await this.db.query(
+      `SELECT * FROM refund_requests WHERE reservation_id=$1 ORDER BY id DESC`,
+      [id],
+    );
+    return { ...r, events: events.rows, incidents: incidents.rows, appeals: appeals.rows, settlement: settlement.rows[0] ?? null, refunds: refunds.rows };
   }
 
   @Roles('driver')

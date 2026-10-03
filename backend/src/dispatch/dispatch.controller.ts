@@ -37,6 +37,10 @@ const INCIDENT_INFO: Record<string, { label: string; noticeTemplate: string }> =
     label: '物业人工放行',
     noticeTemplate: '物业已人工放行，入场服务已绑定到您的预约单',
   },
+  spot_swap: {
+    label: '换位调度',
+    noticeTemplate: '物业已为您协调换位至相邻车位，订单费用按实际占用时段连续计算',
+  },
 };
 
 @Controller('dispatch')
@@ -165,6 +169,95 @@ export class DispatchController {
     );
     await this.db.query(`UPDATE incident_tickets SET status='notified' WHERE id=$1`, [ticket.id]);
     return { ok: true, ticket_id: ticket.id };
+  }
+
+  // 换位调度：物业把进行中订单协调到相邻车位（业主回家/陌生车占用等场景），
+  // 订单延续不换单，费用按实际占用时段连续计算，换位事件进入财务页费用来源
+  @Roles('property', 'admin')
+  @Post('spot-swap')
+  async spotSwap(
+    @CurrentUser() user: JwtUser,
+    @Body() body: { reservation_id: number; to_spot_id: number; reason?: string; occurred_at?: string },
+  ) {
+    const occurredAt = body.occurred_at ? new Date(body.occurred_at) : new Date();
+    return this.db.withTx(async (c) => {
+      const rq = await c.query(
+        `SELECT r.*, s.code AS from_spot_code, v.is_new_energy, v.is_visitor
+         FROM reservations r
+         JOIN parking_spots s ON s.id=r.spot_id
+         JOIN vehicles v ON v.id=r.vehicle_id
+         WHERE r.id=$1 FOR UPDATE`,
+        [body.reservation_id],
+      );
+      const r = rq.rows[0];
+      if (!r) throw new BadRequestException('预约不存在');
+      if (!['admitted', 'in_garage'].includes(r.status))
+        throw new BadRequestException('仅进行中（已入场）的订单可换位调度');
+
+      const sq = await c.query(`SELECT * FROM parking_spots WHERE id=$1`, [body.to_spot_id]);
+      const target = sq.rows[0];
+      if (!target) throw new BadRequestException('目标车位不存在');
+      if (target.id === r.spot_id) throw new BadRequestException('目标车位与当前车位相同');
+      if (target.review_status !== 'approved' || !target.active)
+        throw new BadRequestException('目标车位未通过审核或已停止共享');
+      if (target.near_charger && !r.is_new_energy)
+        throw new BadRequestException('目标车位为充电位，仅限新能源车');
+      if (r.is_visitor && !target.allow_visitor)
+        throw new BadRequestException('目标车位不允许访客车');
+
+      // 剩余时段不得与目标车位已有预约冲突
+      const conflict = await c.query(
+        `SELECT code FROM reservations
+         WHERE spot_id=$1 AND status IN ('reserved','admitted','in_garage')
+           AND start_at < $2 AND $3 < end_at LIMIT 1`,
+        [target.id, r.end_at, occurredAt],
+      );
+      if (conflict.rows[0]) throw new BadRequestException(`目标车位该时段已被预约（${conflict.rows[0].code}）`);
+
+      await c.query(`UPDATE reservations SET spot_id=$1 WHERE id=$2`, [target.id, r.id]);
+      const reason = body.reason ?? '物业现场协调换位';
+      await c.query(
+        `INSERT INTO service_events(reservation_id, spot_id, type, actor_id, actor_role, plate, detail, occurred_at)
+         VALUES ($1,$2,'spot_swap',$3,$4,$5,$6,$7)`,
+        [
+          r.id,
+          target.id,
+          user.sub,
+          user.role,
+          r.plate,
+          JSON.stringify({
+            from_spot: r.from_spot_code,
+            from_spot_id: r.spot_id,
+            to_spot: target.code,
+            to_spot_id: target.id,
+            reason,
+          }),
+          occurredAt,
+        ],
+      );
+      const ticket = await c.query(
+        `INSERT INTO incident_tickets(code, spot_id, reservation_id, type, status, plate, reporter_role, description, resolution, detail, resolved_by, resolved_at, created_at)
+         VALUES ($1,$2,$3,'spot_swap','resolved',$4,$5,$6,$7,$8,$9,$10,$10) RETURNING *`,
+        [
+          'T' + Date.now().toString(36).toUpperCase() + Math.floor(Math.random() * 100),
+          target.id,
+          r.id,
+          r.plate,
+          user.role,
+          `换位调度：${r.from_spot_code} → ${target.code}`,
+          reason,
+          JSON.stringify({ from_spot: r.from_spot_code, from_spot_id: r.spot_id, to_spot: target.code, to_spot_id: target.id, reason }),
+          user.sub,
+          occurredAt,
+        ],
+      );
+      await c.query(
+        `INSERT INTO move_notices(ticket_id, target_plate, channel, message, delivered_at)
+         VALUES ($1,$2,'app_push+led',$3, now())`,
+        [ticket.rows[0].id, r.plate, `您的车位已协调换位：${r.from_spot_code} → ${target.code}，订单费用按实际占用连续计算`],
+      );
+      return { ok: true, ticket: ticket.rows[0], from_spot: r.from_spot_code, to_spot: target.code };
+    });
   }
 
   // 平台/物业派发挪车通知（陌生车/燃油车/错停）

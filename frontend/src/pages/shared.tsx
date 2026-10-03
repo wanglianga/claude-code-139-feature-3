@@ -96,7 +96,7 @@ export function ReservationDetailModal({ id, onClose }: { id: number; onClose: (
       )}
 
       {tab === 'settlement' && (
-        d.settlement ? <SettlementWithLedger id={d.id} /> : <div className="empty">订单尚未离场结算</div>
+        d.settlement ? <SettlementWithLedger id={d.id} refunds={d.refunds ?? []} /> : <div className="empty">订单尚未离场结算</div>
       )}
 
       {tab === 'timeline' && (timeline ? <TimelineView data={timeline} /> : <div className="empty">加载中…</div>)}
@@ -104,7 +104,7 @@ export function ReservationDetailModal({ id, onClose }: { id: number; onClose: (
   );
 }
 
-function SettlementWithLedger({ id }: { id: number }) {
+function SettlementWithLedger({ id, refunds }: { id: number; refunds: any[] }) {
   const [s, setS] = useState<any>(null);
   useEffect(() => {
     api('GET', `/reservations/${id}/settlement`).then((r) => setS(r ? { ...r, ledger: r.ledger ?? [] } : null));
@@ -114,6 +114,27 @@ function SettlementWithLedger({ id }: { id: number }) {
     <div>
       <SettlementView s={s} />
       {!s.ledger?.length && <LedgerTable entries={s.ledger} />}
+      {refunds.length > 0 && (
+        <div style={{ marginTop: 14 }}>
+          <h3 style={{ fontSize: 14, marginBottom: 8 }}>退款申请记录</h3>
+          <div className="table-wrap">
+            <table>
+              <thead><tr><th>退款单</th><th>申请金额</th><th>核准金额</th><th>状态</th><th>校验/审批</th></tr></thead>
+              <tbody>
+                {refunds.map((f) => (
+                  <tr key={f.id}>
+                    <td className="mono small">{f.code}<div className="small muted">{dt(f.created_at)}</div></td>
+                    <td className="money">{money(f.requested_amount)}</td>
+                    <td className="money">{f.status === 'approved' ? money(f.validated_amount) : '—'}</td>
+                    <td><Tag status={f.status} /></td>
+                    <td className="small">{f.review_note ?? (f.checks ?? []).find((c: any) => c.key === 'duplicate')?.detail ?? '—'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

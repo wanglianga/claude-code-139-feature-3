@@ -265,7 +265,10 @@ function OrdersTab() {
                 <tr key={l.id}>
                   <td className="small">{dt(l.created_at)}</td>
                   <td className="small mono">{l.settlement_code}</td>
-                  <td><Tag cls={l.direction === 'credit' ? 'green' : 'amber'} label={l.direction === 'credit' ? '入账' : '出账'} /></td>
+                  <td>
+                    <Tag cls={l.direction === 'credit' ? 'green' : 'amber'} label={l.direction === 'credit' ? '入账' : '出账'} />
+                    {l.reversal_id != null && <Tag cls="red" label="冲正" />}
+                  </td>
                   <td className="money">{money(l.amount)}</td>
                   <td className="small">{l.memo}</td>
                 </tr>

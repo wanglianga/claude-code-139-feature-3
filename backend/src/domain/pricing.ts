@@ -63,6 +63,8 @@ export interface PriceInput {
   ruling?: Ruling | null;
   couponAmount?: number;
   prepaid: number;
+  // 已通过退款单先行退还车主的金额（退款审批通道），结算/重算时从应退中扣减，避免重复冲销
+  externalRefunded?: number;
 }
 
 export interface LedgerDraft {
@@ -76,6 +78,7 @@ export interface SettlementBreakdown {
   actualEntryAt: Date | null;
   actualExitAt: Date | null;
   usableFrom: Date | null;
+  billableEnd: Date; // 计费截止（业主回家提前终止 / 离场时间），跨日分账拆分用
   durationMinutes: number;
   baseFee: number;
   chargingFee: number;
@@ -232,6 +235,15 @@ export function settlePrice(input: PriceInput): SettlementBreakdown {
   let exitCharge = driverNet > prepaid ? round2(driverNet - prepaid) : 0;
   const payable = round2(Math.max(0, driverNet));
 
+  // 退款单通道已先行退还的金额：本次结算不再重复退款（避免重复冲销），
+  // 托管出金口径中该部分视为已执行退款，不再参与平台盈余分配
+  const externalRefunded = round2(Math.max(0, input.externalRefunded ?? 0));
+  const refundedExternally = round2(Math.min(externalRefunded, refund));
+  if (refundedExternally > 0) {
+    refund = round2(refund - refundedExternally);
+    notes.push(`应退款项中 ¥${refundedExternally} 已经退款单先行退还车主，本次结算不再重复退款（避免重复冲销）`);
+  }
+
   // 平台/物业全责且费用全免时，显式标注（退款金额已含预付退还）
   if (['platform_fault', 'property_fault'].includes(ruling ?? '') && gross === 0 && prepaid > 0) {
     notes.push('责任方全责，预约预付款随补偿一并退还车主');
@@ -281,10 +293,10 @@ export function settlePrice(input: PriceInput): SettlementBreakdown {
   const strangerAdvance = ruling === 'stranger' ? ownerCompensation : 0;
   const ownerTotal = round2(Math.max(0, ownerShareEarn - ownerPaysComp) + ownerCompFromPool);
 
-  // 托管池：入金 = 预付 + 离场补缴 + 券池出资；出金 = 退款 + 业主收 + 物业收。
+  // 托管池：入金 = 预付 + 离场补缴 + 券池出资；出金 = 退款 + 已外部退还 + 业主收 + 物业收。
   // 出金多于入金的缺口由平台现金兜底，盈余归平台抽成。
   const escrowIn = round2(prepaid + exitCharge + couponDiscount);
-  const escrowOutBeforePlatform = round2(refund + ownerTotal + propertyFee);
+  const escrowOutBeforePlatform = round2(refund + refundedExternally + ownerTotal + propertyFee);
   const gap = round2(escrowOutBeforePlatform - escrowIn);
   const platformTopup = Math.max(0, gap);
   const platformRetained = Math.max(0, -gap);
@@ -358,6 +370,7 @@ export function settlePrice(input: PriceInput): SettlementBreakdown {
     actualEntryAt: input.actualEntry ?? null,
     actualExitAt: input.actualExit ?? null,
     usableFrom,
+    billableEnd,
     durationMinutes,
     baseFee,
     chargingFee,

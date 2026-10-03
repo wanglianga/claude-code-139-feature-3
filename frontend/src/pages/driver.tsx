@@ -12,6 +12,7 @@ const NAV = [
   { key: 'browse', label: '找车位预约', icon: '🔍' },
   { key: 'active', label: '我的停车服务', icon: '🚗' },
   { key: 'vehicles', label: '车辆与优惠券', icon: '🎫' },
+  { key: 'refunds', label: '退款申请', icon: '💸' },
   { key: 'appeals', label: '错停申诉', icon: '⚖️' },
 ];
 
@@ -22,6 +23,7 @@ export function DriverWorkspace({ session }: { session: Session }) {
       {tab === 'browse' && <BrowseTab />}
       {tab === 'active' && <OrdersTab />}
       {tab === 'vehicles' && <VehiclesTab />}
+      {tab === 'refunds' && <RefundsTab />}
       {tab === 'appeals' && <AppealsTab />}
     </WorkspaceShell>
   );
@@ -431,6 +433,112 @@ function VehiclesTab() {
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+// ---------- 退款申请（平台按道闸/巡查/离场时间校验可退金额）----------
+function RefundsTab() {
+  const { data: orders } = useLoader<any[]>('/reservations?scope=mine');
+  const { data: refunds, reload } = useLoader<any[]>('/refund-requests');
+  const completed = (orders ?? []).filter((o) => o.status === 'completed');
+  const [reservationId, setReservationId] = useState<number | ''>('');
+  const [amount, setAmount] = useState('');
+  const [reason, setReason] = useState('');
+  const [result, setResult] = useState<any>(null);
+  const [err, setErr] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const submit = async () => {
+    setErr(''); setResult(null); setBusy(true);
+    try {
+      const r = await api('POST', `/reservations/${reservationId}/refund-requests`, {
+        amount: Number(amount),
+        reason,
+      });
+      setResult(r);
+      setAmount(''); setReason('');
+      reload();
+    } catch (e: any) {
+      setErr(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div>
+      <PageHead title="退款申请" desc="平台按道闸记录、物业巡查与离场时间校验可退金额，已退部分自动扣减，避免重复冲销" />
+      <div className="grid grid-2">
+        <div className="card">
+          <h3>发起退款申请</h3>
+          {err && <div className="alert error">{err}</div>}
+          {result && (
+            <div className="alert ok">
+              退款申请已提交（{result.code}），系统校验可退上限 {money(result.validation?.maxRefundable)}，等待物业审核
+            </div>
+          )}
+          <div className="field">
+            <label>选择已结算订单</label>
+            <select value={reservationId} onChange={(e) => setReservationId(e.target.value ? Number(e.target.value) : '')}>
+              <option value="">请选择订单</option>
+              {completed.map((o: any) => (
+                <option key={o.id} value={o.id}>{o.code} · {o.spot_code} · {dt(o.start_at)}</option>
+              ))}
+            </select>
+          </div>
+          <div className="field"><label>申请退款金额（元）</label><input type="number" min="0" step="0.01" value={amount} onChange={(e) => setAmount(e.target.value)} /></div>
+          <div className="field"><label>退款理由</label><textarea value={reason} onChange={(e) => setReason(e.target.value)} placeholder="如：申诉裁定平台责任免单 / 道闸离场时间记录有误多扣费…" /></div>
+          <button className="btn" disabled={busy || !reservationId || !(Number(amount) > 0)} onClick={submit}>
+            {busy ? '提交中…' : '提交申请并校验'}
+          </button>
+          {result && (
+            <div style={{ marginTop: 12 }}>
+              <h3 style={{ fontSize: 14, marginBottom: 8 }}>系统校验明细</h3>
+              <RefundChecks checks={result.validation?.checks} />
+            </div>
+          )}
+        </div>
+        <div className="card">
+          <h3>我的退款记录 <span className="hint">{refunds?.length ?? 0} 笔</span></h3>
+          {(refunds ?? []).length === 0 && <div className="empty">暂无退款申请</div>}
+          {(refunds ?? []).map((f) => (
+            <div key={f.id} className={`ticket-card ${f.status === 'approved' ? 'resolved' : f.status === 'rejected' ? 'open' : 'notified'}`}>
+              <div className="ticket-head">
+                <span className="ticket-title">{f.code} · {money(f.requested_amount)}</span>
+                <Tag status={f.status} />
+              </div>
+              <div className="ticket-desc">{f.reason || '（未填写理由）'} · 订单 {f.reservation_code} · {f.spot_code}</div>
+              <div className="small muted">
+                {dt(f.created_at)}
+                {f.status === 'approved' && ` · 核准 ${money(f.validated_amount)} 已到账`}
+                {f.review_note ? ` · ${f.review_note}` : ''}
+              </div>
+              <details style={{ marginTop: 6 }}>
+                <summary className="small muted" style={{ cursor: 'pointer' }}>校验明细（道闸 / 巡查 / 离场时间 / 重复冲销）</summary>
+                <RefundChecks checks={f.checks} />
+              </details>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export function RefundChecks({ checks }: { checks?: any[] }) {
+  if (!checks?.length) return <div className="empty small">暂无校验明细</div>;
+  return (
+    <div style={{ marginTop: 8 }}>
+      {checks.map((c, i) => (
+        <div key={i} className="small" style={{ padding: '4px 0', display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+          <Tag cls={c.passed ? 'green' : 'red'} label={c.passed ? '通过' : '未通过'} />
+          <div>
+            <b>{c.label}</b>
+            <div className="muted">{c.detail}</div>
+          </div>
+        </div>
+      ))}
     </div>
   );
 }

@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { api } from '../api';
 import { useLoader } from '../hooks';
 import { WorkspaceShell } from '../App';
-import { dt, INCIDENT_LABEL, Tag } from '../ui';
+import { dt, INCIDENT_LABEL, money, Tag } from '../ui';
 import { OrderTable } from './owner';
 import { AppealDetailModal, ReservationDetailModal } from './shared';
 
@@ -13,6 +13,7 @@ const NAV = [
   { key: 'dispatch', label: '夜间调度看板', icon: '🌙' },
   { key: 'patrol', label: '巡查登记', icon: '🔦' },
   { key: 'appeals', label: '申诉裁决', icon: '⚖️' },
+  { key: 'refunds', label: '退款审核', icon: '💸' },
   { key: 'orders', label: '订单追溯', icon: '🧾' },
 ];
 
@@ -25,6 +26,7 @@ export function PropertyWorkspace({ session }: { session: Session }) {
       {tab === 'dispatch' && <DispatchTab />}
       {tab === 'patrol' && <PatrolTab />}
       {tab === 'appeals' && <AppealsTab />}
+      {tab === 'refunds' && <RefundReviewTab />}
       {tab === 'orders' && <OrdersTab />}
     </WorkspaceShell>
   );
@@ -179,6 +181,7 @@ function DispatchTab() {
   const { data: tickets, reload } = useLoader<any[]>(`/dispatch/incidents${status ? `?status=${status}` : ''}`);
   const { data: overview } = useLoader<any>('/dispatch/overview');
   const [openNotices, setOpenNotices] = useState<any | null>(null);
+  const [swapOpen, setSwapOpen] = useState(false);
   const [msg, setMsg] = useState('');
 
   const notify = async (t: any) => {
@@ -207,8 +210,11 @@ function DispatchTab() {
 
   return (
     <div>
-      <PageHead title="夜间调度看板" desc="集中处理业主临时回家、访客超时、陌生车占用、识别失败、信号差、燃油车占充电位、人工放行等夜间事件" right={
-        <button className="btn ghost" onClick={overstay}>访客超时预警</button>
+      <PageHead title="夜间调度看板" desc="集中处理业主临时回家、访客超时、陌生车占用、识别失败、信号差、燃油车占充电位、人工放行、换位调度等夜间事件" right={
+        <div className="btn-row">
+          <button className="btn ghost" onClick={() => setSwapOpen(true)}>🔀 换位调度</button>
+          <button className="btn ghost" onClick={overstay}>访客超时预警</button>
+        </div>
       } />
       {msg && <div className="alert ok">{msg}</div>}
       <div className="grid grid-4" style={{ marginBottom: 16 }}>
@@ -257,6 +263,81 @@ function DispatchTab() {
         ))}
       </div>
       {openNotices && <NoticesModal ticket={openNotices} onClose={() => setOpenNotices(null)} />}
+      {swapOpen && (
+        <SpotSwapModal
+          onClose={() => setSwapOpen(false)}
+          onDone={(m: string) => { setSwapOpen(false); setMsg(m); reload(); }}
+        />
+      )}
+    </div>
+  );
+}
+
+// 换位调度：把进行中订单协调到相邻车位，费用按实际占用连续计算并进入财务页费用来源
+function SpotSwapModal({ onClose, onDone }: { onClose: () => void; onDone: (msg: string) => void }) {
+  const { data: orders } = useLoader<any[]>('/reservations');
+  const { data: spots } = useLoader<any[]>('/spots');
+  const active = (orders ?? []).filter((o) => ['admitted', 'in_garage'].includes(o.status));
+  const [reservationId, setReservationId] = useState<number | ''>('');
+  const [toSpotId, setToSpotId] = useState<number | ''>('');
+  const [reason, setReason] = useState('');
+  const [err, setErr] = useState('');
+  const [busy, setBusy] = useState(false);
+  const order = active.find((o) => o.id === reservationId);
+  const targets = (spots ?? []).filter((s: any) => s.review_status === 'approved' && s.id !== order?.spot_id);
+
+  const submit = async () => {
+    setErr(''); setBusy(true);
+    try {
+      const r = await api('POST', '/dispatch/spot-swap', {
+        reservation_id: reservationId,
+        to_spot_id: toSpotId,
+        reason: reason || undefined,
+      });
+      onDone(`换位调度完成：${r.from_spot} → ${r.to_spot}，挪车通知已推送车主，费用按实际占用连续计算`);
+    } catch (e: any) {
+      setErr(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="modal-mask" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
+      <div className="modal">
+        <div className="modal-head"><h3>换位调度（进行中订单换车位）</h3><button className="close-x" onClick={onClose}>×</button></div>
+        <div className="modal-body">
+          {err && <div className="alert error">{err}</div>}
+          {active.length === 0 && <div className="empty">当前没有进行中的订单</div>}
+          <div className="field">
+            <label>进行中订单</label>
+            <select value={reservationId} onChange={(e) => setReservationId(e.target.value ? Number(e.target.value) : '')}>
+              <option value="">请选择订单</option>
+              {active.map((o: any) => (
+                <option key={o.id} value={o.id}>{o.code} · {o.spot_code} · {o.plate}（{o.driver_name}）</option>
+              ))}
+            </select>
+          </div>
+          <div className="field">
+            <label>换位至目标车位</label>
+            <select value={toSpotId} onChange={(e) => setToSpotId(e.target.value ? Number(e.target.value) : '')}>
+              <option value="">请选择车位</option>
+              {targets.map((s: any) => (
+                <option key={s.id} value={s.id}>{s.community_name} · {s.code}（{s.location_desc}）</option>
+              ))}
+            </select>
+          </div>
+          <div className="field">
+            <label>换位原因</label>
+            <input value={reason} onChange={(e) => setReason(e.target.value)} placeholder="如：原车位地锁故障 / 业主临时回家协调至相邻车位" />
+          </div>
+          <div className="alert info">换位后订单延续不换单：费用按实际占用时段连续计算，换位事件将标注在财务页该时段的费用来源中。</div>
+        </div>
+        <div className="modal-foot">
+          <button className="btn gray" onClick={onClose}>取消</button>
+          <button className="btn" disabled={busy || !reservationId || !toSpotId} onClick={submit}>{busy ? '提交中…' : '确认换位'}</button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -403,6 +484,88 @@ function AppealsTab() {
         </div>
       </div>
       {open && <AppealDetailModal id={open} onClose={() => setOpen(null)} onChanged={reload} />}
+    </div>
+  );
+}
+
+// ---------- 退款审核（按道闸/巡查/离场时间校验结果审批）----------
+function RefundReviewTab() {
+  const { data: refunds, reload } = useLoader<any[]>('/refund-requests');
+  const [msg, setMsg] = useState('');
+  const [err, setErr] = useState('');
+
+  const review = async (f: any, approve: boolean) => {
+    setErr(''); setMsg('');
+    const note = approve ? '校验属实，同意退款' : (prompt('驳回原因', '证据不足，退款申请驳回') ?? undefined);
+    if (!approve && note === undefined) return;
+    try {
+      const r = await api('POST', `/refund-requests/${f.id}/review`, { approve, note });
+      setMsg(
+        r.status === 'approved'
+          ? `退款单 ${f.code} 已核准 ${r.validated_amount} 元（托管账户 → 车主）`
+          : `退款单 ${f.code} 已驳回${r.validation?.maxRefundable <= 0 ? '（重复冲销校验：可退余额为 0）' : ''}`,
+      );
+      reload();
+    } catch (e: any) {
+      setErr(e.message);
+    }
+  };
+
+  const pending = (refunds ?? []).filter((f) => f.status === 'pending');
+  const done = (refunds ?? []).filter((f) => f.status !== 'pending');
+
+  return (
+    <div>
+      <PageHead title="退款审核" desc="系统已按道闸记录、物业巡查与离场时间校验可退金额；超额申请自动截断，可退余额为 0 自动拒绝（避免重复冲销）" />
+      {msg && <div className="alert ok">{msg}</div>}
+      {err && <div className="alert error">{err}</div>}
+      <div className="card">
+        <h3>待审核 <span className="hint">{pending.length} 笔</span></h3>
+        {pending.length === 0 && <div className="empty">没有待审核的退款申请</div>}
+        {pending.map((f) => (
+          <div key={f.id} className="ticket-card notified">
+            <div className="ticket-head">
+              <span className="ticket-title">{f.code} · {f.driver_name} 申请 {money(f.requested_amount)}</span>
+              <Tag cls="amber" label={`系统校验可退上限 ${money(f.validated_amount)}`} />
+            </div>
+            <div className="ticket-desc">{f.reason || '（未填写理由）'} · 订单 {f.reservation_code} · {f.spot_code} · {f.plate}</div>
+            <div style={{ margin: '8px 0' }}>
+              {(f.checks ?? []).map((c: any, i: number) => (
+                <div key={i} className="small" style={{ padding: '3px 0', display: 'flex', gap: 8 }}>
+                  <Tag cls={c.passed ? 'green' : 'red'} label={c.passed ? '通过' : '未通过'} />
+                  <span><b>{c.label}</b>：<span className="muted">{c.detail}</span></span>
+                </div>
+              ))}
+            </div>
+            <div className="btn-row">
+              <button className="btn sm success" onClick={() => review(f, true)}>按校验上限核准退款</button>
+              <button className="btn sm danger" onClick={() => review(f, false)}>驳回</button>
+            </div>
+          </div>
+        ))}
+      </div>
+      <div className="card">
+        <h3>已处理</h3>
+        {done.length === 0 && <div className="empty">暂无</div>}
+        <div className="table-wrap">
+          <table>
+            <thead><tr><th>退款单</th><th>车主/订单</th><th>申请</th><th>核准</th><th>状态</th><th>审批说明</th><th>时间</th></tr></thead>
+            <tbody>
+              {done.map((f) => (
+                <tr key={f.id}>
+                  <td className="mono small">{f.code}</td>
+                  <td className="small">{f.driver_name}<div className="small muted mono">{f.reservation_code}</div></td>
+                  <td className="money">{money(f.requested_amount)}</td>
+                  <td className="money">{f.status === 'approved' ? money(f.validated_amount) : '—'}</td>
+                  <td><Tag status={f.status} /></td>
+                  <td className="small" style={{ maxWidth: 260 }}>{f.review_note ?? '—'}</td>
+                  <td className="small muted">{dt(f.reviewed_at)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
     </div>
   );
 }

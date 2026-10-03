@@ -38,6 +38,7 @@ export function SettlementView({ s }: { s: any }) {
       <div style={{ height: 10 }} />
       <div className="btn-row">
         <RulingTag ruling={s.ruling} />
+        {s.detail?.cross_day && <Tag cls="purple" label="跨日分账" />}
         {Number(s.credit_delta) !== 0 && (
           <Tag cls={Number(s.credit_delta) < 0 ? 'red' : 'green'}
             label={`信用 ${s.credit_target === 'driver' ? '车主' : s.credit_target === 'owner' ? '业主' : '物业'} ${s.credit_delta > 0 ? '+' : ''}${s.credit_delta}`} />
@@ -52,7 +53,84 @@ export function SettlementView({ s }: { s: any }) {
           </ul>
         </div>
       )}
+      <DaySegmentsTable segments={s.day_segments} />
+      {s.reversals?.length > 0 && (
+        <div className="alert info" style={{ marginTop: 12 }}>
+          <b>关联冲正单：</b>
+          {s.reversals.map((rv: any) => (
+            <div key={rv.id} className="small" style={{ marginTop: 4 }}>
+              <Tag cls="red" label="冲正" /> <span className="mono">{rv.code}</span>：申诉 {rv.appeal_code} 成立后红冲原分账
+              <span className="mono"> {rv.settlement_code}</span>，当前有效分账为本单（{rv.new_settlement_code}） · {dt(rv.created_at)}
+            </div>
+          ))}
+        </div>
+      )}
       <LedgerTable entries={s.ledger} />
+    </div>
+  );
+}
+
+// ---------- 跨日分账：按结算日拆分的费用段与费用来源 ----------
+const SOURCE_TAG: Record<string, { label: string; cls: string }> = {
+  coupon: { label: '优惠券', cls: 'green' },
+  manual_release: { label: '人工放行', cls: 'purple' },
+  spot_swap: { label: '换位调度', cls: 'cyan' },
+  owner_return: { label: '业主回家', cls: 'amber' },
+  stranger_occupy: { label: '异常占用', cls: 'red' },
+  weak_signal: { label: '信号差', cls: 'amber' },
+  wrong_parking: { label: '错停核验', cls: 'red' },
+  overstay: { label: '访客超时', cls: 'amber' },
+  charging: { label: '充电服务', cls: 'green' },
+};
+
+export function DaySegmentsTable({ segments }: { segments: any[] }) {
+  if (!segments?.length) return null;
+  const crossDay = segments.length > 1;
+  const pick = (g: any, snake: string, camel: string) => g[snake] ?? g[camel];
+  return (
+    <div style={{ marginTop: 14 }}>
+      <h3 style={{ fontSize: 14, marginBottom: 8 }}>
+        分日段拆分
+        <Tag cls={crossDay ? 'purple' : 'gray'} label={crossDay ? `跨 ${segments.length} 个结算日` : '单结算日'} />
+        <span className="hint">凌晨离场跨结算日时，按实际占用时段拆分业主收益与物业服务费</span>
+      </h3>
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>结算日</th><th>占用时段</th><th>分钟</th><th>基础费</th><th>充电费</th><th>超时费</th>
+              <th>业主收益</th><th>物业费</th><th>平台</th><th>费用来源</th>
+            </tr>
+          </thead>
+          <tbody>
+            {segments.map((g, i) => {
+              const sources = g.sources ?? [];
+              return (
+                <tr key={i}>
+                  <td className="mono small">{String(pick(g, 'settlement_date', 'settlementDate')).slice(0, 10)}</td>
+                  <td className="small mono">{hm(pick(g, 'from_at', 'from'))}–{hm(pick(g, 'to_at', 'to'))}</td>
+                  <td>{g.minutes}</td>
+                  <td className="money">{money(pick(g, 'base_fee', 'baseFee'))}</td>
+                  <td className="money">{money(pick(g, 'charging_fee', 'chargingFee'))}</td>
+                  <td className="money">{money(pick(g, 'overtime_fee', 'overtimeFee'))}</td>
+                  <td className="money">{money(pick(g, 'owner_income', 'ownerIncome'))}</td>
+                  <td className="money">{money(pick(g, 'property_fee', 'propertyFee'))}</td>
+                  <td className="money">{money(pick(g, 'platform_fee', 'platformFee'))}</td>
+                  <td className="small" style={{ minWidth: 180 }}>
+                    {sources.length === 0 && <span className="muted">—</span>}
+                    {sources.map((src: any, j: number) => (
+                      <div key={j} style={{ marginBottom: 2 }}>
+                        <Tag cls={SOURCE_TAG[src.type]?.cls ?? 'gray'} label={SOURCE_TAG[src.type]?.label ?? src.type} />
+                        {' '}<span className="small">{src.label}</span>
+                      </div>
+                    ))}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }
@@ -97,6 +175,8 @@ export function LedgerTable({ entries }: { entries: any[] }) {
                 <td>{accountLabel(e.account)}</td>
                 <td>
                   <Tag cls={e.direction === 'debit' ? 'amber' : 'green'} label={e.direction === 'debit' ? '借方' : '贷方'} />
+                  {e.reversal_id != null && <Tag cls="red" label="冲正" />}
+                  {e.refund_request_id != null && <Tag cls="cyan" label="退款单" />}
                 </td>
                 <td className="money">{money(e.amount)}</td>
                 <td className="small">{e.memo}</td>
@@ -282,6 +362,11 @@ const EVENT_LABEL: Record<string, string> = {
   settlement_recomputed: '分账重算',
   credit_adjusted: '信用调整',
   monthly_priority_conflict: '月租优先冲突',
+  spot_swap: '换位调度',
+  charging_session: '充电会话',
+  refund_requested: '退款申请',
+  refund_approved: '退款到账',
+  refund_rejected: '退款驳回',
 };
 
 const EVENT_COLOR: Record<string, string> = {
@@ -289,6 +374,8 @@ const EVENT_COLOR: Record<string, string> = {
   owner_return_report: 'amber', weak_signal_report: 'amber', move_notice_sent: 'amber',
   gate_entry: 'cyan', parking_confirmed: 'green', settlement_completed: 'blue',
   appeal_ruled: 'purple', manual_release: 'purple', incident_resolved: 'green',
+  spot_swap: 'cyan', charging_session: 'green', refund_requested: 'amber',
+  refund_approved: 'green', refund_rejected: 'red',
 };
 
 export function ServiceEvents({ events }: { events: any[] }) {

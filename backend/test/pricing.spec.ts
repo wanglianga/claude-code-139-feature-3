@@ -124,6 +124,23 @@ describe('settlePrice', () => {
     expect(r.creditDelta).toBe(0);
   });
 
+  test('退款单已先行退还的金额不再重复退款（避免重复冲销），流水仍平衡', () => {
+    const r = settlePrice({
+      ...baseInput,
+      chargeKwh: 0,
+      ruling: 'platform_fault',
+      prepaid: 45,
+      externalRefunded: 45, // 退款单已退 45
+    });
+    expect(r.refund).toBe(0); // 不再重复退
+    expect(r.notes.some((n) => n.includes('不再重复退款'))).toBe(true);
+    const debit = r.ledger.filter((l) => l.direction === 'debit').reduce((a, b) => a + b.amount, 0);
+    const credit = r.ledger.filter((l) => l.direction === 'credit').reduce((a, b) => a + b.amount, 0);
+    expect(Math.abs(debit - credit)).toBeLessThanOrEqual(0.05);
+    // 托管不再把已外部退还的部分分给平台
+    expect(r.ledger.some((l) => l.account === 'platform' && l.direction === 'credit' && l.amount >= 45)).toBe(false);
+  });
+
   test('资金流水借贷平衡（车主净付 = 各方净收）', () => {
     const cases = [
       { ...baseInput },
