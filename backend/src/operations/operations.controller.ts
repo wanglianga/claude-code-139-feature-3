@@ -129,8 +129,8 @@ export class OperationsController {
         [r.id, body.entry_at ?? null],
       );
       await c.query(
-        `INSERT INTO service_events(reservation_id, spot_id, type, actor_id, actor_role, plate, gate, confidence, detail)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        `INSERT INTO service_events(reservation_id, spot_id, type, actor_id, actor_role, plate, gate, confidence, detail, occurred_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,COALESCE($10::timestamptz, now()))`,
         [
           r.id,
           r.spot_id,
@@ -141,12 +141,13 @@ export class OperationsController {
           body.gate,
           body.confidence ?? (manual ? null : 0.95),
           JSON.stringify({ mode: body.mode, note: body.note ?? null }),
+          body.entry_at ?? null,
         ],
       );
       if (manual) {
         await c.query(
-          `INSERT INTO incident_tickets(code, spot_id, reservation_id, type, status, plate, reporter_role, description, resolution, resolved_by, resolved_at)
-           VALUES ($1,$2,$3,'manual_release','resolved',$4,'property',$5,$6,$7,now())`,
+          `INSERT INTO incident_tickets(code, spot_id, reservation_id, type, status, plate, reporter_role, description, resolution, resolved_by, resolved_at, created_at)
+           VALUES ($1,$2,$3,'manual_release','resolved',$4,'property',$5,$6,$7,now(),COALESCE($8::timestamptz, now()))`,
           [
             'T' + Date.now().toString(36).toUpperCase(),
             r.spot_id,
@@ -155,6 +156,7 @@ export class OperationsController {
             body.note ?? '物业核对预约后人工放行',
             body.note ?? '人工放行完成',
             user.sub,
+            body.entry_at ?? null,
           ],
         );
       }
@@ -246,8 +248,8 @@ export class OperationsController {
       );
       if (wrong) {
         await c.query(
-          `INSERT INTO incident_tickets(code, spot_id, reservation_id, type, status, plate, reporter_role, description, detail)
-           VALUES ($1,$2,$3,'wrong_parking','open',$4,'driver',$5,$6)`,
+          `INSERT INTO incident_tickets(code, spot_id, reservation_id, type, status, plate, reporter_role, description, detail, created_at)
+           VALUES ($1,$2,$3,'wrong_parking','open',$4,'driver',$5,$6,COALESCE($7::timestamptz, now()))`,
           [
             'T' + Date.now().toString(36).toUpperCase(),
             r.spot_id,
@@ -255,6 +257,7 @@ export class OperationsController {
             r.plate,
             `车辆停在 ${body.actual_spot_code}，预约车位为 ${r.spot_code}`,
             JSON.stringify({ expected: r.spot_code, actual: body.actual_spot_code }),
+            body.parked_at ?? null,
           ],
         );
       }
@@ -292,11 +295,15 @@ export class OperationsController {
         wrong_park: 'wrong_parking',
         ice_on_charger: 'ice_occupy_charger',
       } as const;
-      // 尝试关联进行中的预约
+      // 尝试关联时间窗重叠的同车位预约（车主已预约但受阻未入场 / 已入场 / 已在库），
+      // 优先取在场程度最高的订单，使巡查证据进入该订单退款/分账校验
       const rel = await this.db.query(
-        `SELECT id FROM reservations WHERE spot_id=$1 AND status='in_garage'
-         ORDER BY start_at DESC LIMIT 1`,
-        [body.spot_id],
+        `SELECT id FROM reservations
+         WHERE spot_id=$1 AND status IN ('reserved','admitted','in_garage')
+           AND $2::timestamptz BETWEEN start_at - interval '3 hour' AND end_at + interval '3 hour'
+         ORDER BY CASE status WHEN 'in_garage' THEN 0 WHEN 'admitted' THEN 1 ELSE 2 END, start_at DESC
+         LIMIT 1`,
+        [body.spot_id, now],
       );
       const ticket = await this.upsertOpenTicket(this.db, {
         spotId: body.spot_id,

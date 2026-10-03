@@ -1,6 +1,9 @@
 // 计费与分账核心规则（纯函数，便于单元测试）
 // 合并：基础停车费、充电费、访客超时费、错停罚款、优惠券、退款、异常补偿、业主补偿
 // 再按 业主/物业/平台 比例清算，并生成可解释的资金流水。
+// 跨日（凌晨离场跨越两个结算日）时，由 buildDaySplits 按实际占用时段拆分各方收益。
+
+import { buildDaySplits, ChargeEvent as SplitChargeEvent, DaySplit } from './daysplit';
 
 export const SHARES = {
   owner: 0.7, // 业主收益占净收入池比例
@@ -59,10 +62,13 @@ export interface PriceInput {
   overnightCap?: number | null;
   isNewEnergy: boolean;
   chargeKwh: number;
+  // 充电发生时点（用于跨日充电费归属）；缺省时按占用时长占比分摊
+  chargeEvents?: SplitChargeEvent[];
   incidents: IncidentInput[];
   ruling?: Ruling | null;
   couponAmount?: number;
   prepaid: number;
+  reservedSpotCode?: string;
 }
 
 export interface LedgerDraft {
@@ -98,6 +104,12 @@ export interface SettlementBreakdown {
   creditTarget: 'driver' | 'owner' | 'property' | 'none';
   creditDelta: number;
   ruling: Ruling | null;
+  // 跨日分账（UTC+8 结算日）：各段费用与三方收益拆分，合计与本单总账严格相等
+  rawBaseFee: number;
+  capApplied: boolean;
+  overtimeFrom: Date | null;
+  wrongParkAt: Date | null;
+  splits: DaySplit[];
   ledger: LedgerDraft[];
   notes: string[];
 }
@@ -124,12 +136,15 @@ export function settlePrice(input: PriceInput): SettlementBreakdown {
   // ---- 基础停车费（跨夜封顶）----
   // 服务未实际交付（平台/物业/陌生车责任）时免收停车费；业主违约时按实际可用时长照实计费
   const feeWaived = ['platform_fault', 'property_fault', 'stranger'].includes(ruling ?? '');
+  const hours = durationMinutes / 60;
+  const rawBaseFee = round2(hours * input.hourlyRate);
   let baseFee = 0;
+  let capApplied = false;
   if (ruling === 'no_fault' || !feeWaived) {
-    const hours = durationMinutes / 60;
-    baseFee = round2(hours * input.hourlyRate);
+    baseFee = rawBaseFee;
     if (input.overnightCap && baseFee > input.overnightCap) {
       baseFee = input.overnightCap;
+      capApplied = true;
       notes.push(`夜间封顶价 ¥${input.overnightCap} 生效`);
     }
   }
@@ -148,13 +163,13 @@ export function settlePrice(input: PriceInput): SettlementBreakdown {
 
   // ---- 访客超时费（离场宽限外，按超时倍率）----
   let overtimeFee = 0;
+  let overtimeFrom: Date | null = null;
   const overstay = input.incidents.find((i) => i.type === 'visitor_overstay');
   if (input.actualExit && input.actualExit > input.reservedEnd) {
-    const overMin = minutes(
-      new Date(input.reservedEnd.getTime() + PRICING.freeExitGraceMinutes * 60000),
-      input.actualExit,
-    );
+    const overStart = new Date(input.reservedEnd.getTime() + PRICING.freeExitGraceMinutes * 60000);
+    const overMin = minutes(overStart, input.actualExit);
     if (overMin > 0) {
+      overtimeFrom = overStart;
       overtimeFee = round2(((overMin / 60) * input.hourlyRate * PRICING.overtimeMultiplier));
       notes.push(`超时 ${Math.round(overMin)} 分钟，按 ${PRICING.overtimeMultiplier}× 计费`);
     }
@@ -167,12 +182,14 @@ export function settlePrice(input: PriceInput): SettlementBreakdown {
   // ---- 错停罚款与业主补偿 ----
   let wrongParkFine = 0;
   let ownerCompensation = 0;
-  const wrongPark = input.incidents.some((i) => i.type === 'wrong_parking');
+  const wrongParkIncident = input.incidents.find((i) => i.type === 'wrong_parking');
+  const wrongPark = !!wrongParkIncident;
   if (wrongPark || ruling === 'driver_fault' || ruling === 'mixed') {
     wrongParkFine = PRICING.wrongParkFine;
     ownerCompensation = PRICING.ownerCompensationWrongPark;
     notes.push(`认定车主错停：违约金 ¥${wrongParkFine}，其中 ¥${ownerCompensation} 补偿业主`);
   }
+  const wrongParkAt = wrongParkIncident?.started_at ?? (wrongParkFine > 0 ? usableFrom : null);
 
   // ---- 异常补偿 ----
   // 现金补偿（业主/陌生车责任，进入退款-托管资金流）与赔付券（平台/物业/信号问题，非现金，下次抵扣）分开
@@ -354,6 +371,36 @@ export function settlePrice(input: PriceInput): SettlementBreakdown {
 
   durationMinutes = Math.round(durationMinutes);
 
+  // ---- 跨日分账拆分（UTC+8 结算日；凌晨离场跨两个自然日时各方收益按实际占用时段归属）----
+  const splits = buildDaySplits({
+    usableFrom,
+    billableTo: billableEnd,
+    exitAt: exit,
+    hourlyRate: input.hourlyRate,
+    baseFee,
+    rawBaseFee,
+    capApplied,
+    chargingFee,
+    chargeUnitPrice: PRICING.chargerPricePerKwh,
+    chargeEvents: input.chargeEvents,
+    overtimeFee,
+    overtimeFrom,
+    wrongParkFine,
+    fineAt: wrongParkAt,
+    couponDiscount,
+    ownerShareEarn,
+    propertyFee,
+    platformServiceEarn,
+    fineResidual,
+    ownerPaysComp,
+    ownerCompFromPool,
+    strangerAdvance,
+    platformDriverCash: ruling === 'stranger' ? PRICING.ownerReturnCompensation : 0,
+    incidents: input.incidents,
+    reservedSpotCode: input.reservedSpotCode ?? '',
+    ruling,
+  });
+
   return {
     actualEntryAt: input.actualEntry ?? null,
     actualExitAt: input.actualExit ?? null,
@@ -380,6 +427,11 @@ export function settlePrice(input: PriceInput): SettlementBreakdown {
     creditTarget,
     creditDelta,
     ruling,
+    rawBaseFee,
+    capApplied,
+    overtimeFrom,
+    wrongParkAt,
+    splits,
     ledger,
     notes,
   };

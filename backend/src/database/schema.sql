@@ -225,6 +225,81 @@ CREATE TABLE IF NOT EXISTS ledger_entries (
 );
 CREATE INDEX IF NOT EXISTS idx_ledger_settlement ON ledger_entries(settlement_id);
 
+-- 跨日分账：车辆凌晨离场跨越多个结算日（UTC+8 日界），按实际占用时段拆分
+-- 业主收益/物业服务费/平台抽成；每段记录费用来源（正常使用/换位/优惠券/人工放行/异常）
+CREATE TABLE IF NOT EXISTS settlement_day_splits (
+  id BIGSERIAL PRIMARY KEY,
+  settlement_id BIGINT NOT NULL REFERENCES settlements(id) ON DELETE CASCADE,
+  settlement_date DATE NOT NULL,              -- 结算日（UTC+8 日历日）
+  period_from TIMESTAMPTZ NOT NULL,
+  period_to TIMESTAMPTZ NOT NULL,
+  duration_minutes INT NOT NULL DEFAULT 0,
+  spot_code TEXT,                             -- 该段实际占用车位（换位时与预约车位不同）
+  base_fee NUMERIC(10,2) NOT NULL DEFAULT 0,
+  charging_fee NUMERIC(10,2) NOT NULL DEFAULT 0,
+  overtime_fee NUMERIC(10,2) NOT NULL DEFAULT 0,
+  wrong_park_fine NUMERIC(10,2) NOT NULL DEFAULT 0,
+  coupon_discount NUMERIC(10,2) NOT NULL DEFAULT 0,
+  service_revenue NUMERIC(10,2) NOT NULL DEFAULT 0,
+  owner_income NUMERIC(10,2) NOT NULL DEFAULT 0,
+  property_fee NUMERIC(10,2) NOT NULL DEFAULT 0,
+  platform_fee NUMERIC(10,2) NOT NULL DEFAULT 0,
+  sources JSONB NOT NULL DEFAULT '[]'::jsonb, -- 每段费用来源说明 [{kind,label,amount?,at?}]
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_day_split_settlement ON settlement_day_splits(settlement_id);
+CREATE INDEX IF NOT EXISTS idx_day_split_date ON settlement_day_splits(settlement_date);
+
+-- 车主退款申请：平台按道闸/巡查/离场时间校验可退金额，审批通过后生成冲正单，防重复冲销
+CREATE TABLE IF NOT EXISTS refund_requests (
+  id BIGSERIAL PRIMARY KEY,
+  code TEXT UNIQUE NOT NULL,
+  reservation_id BIGINT NOT NULL REFERENCES reservations(id),
+  driver_id BIGINT NOT NULL REFERENCES users(id),
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending','approved','rejected','paid','cancelled')),
+  reason TEXT NOT NULL,
+  requested_amount NUMERIC(10,2) NOT NULL DEFAULT 0,
+  validated_amount NUMERIC(10,2) NOT NULL DEFAULT 0,   -- 平台校验后确认的现金可退额
+  coupon_reissue NUMERIC(10,2) NOT NULL DEFAULT 0,    -- 券抵扣部分不退现金，补发等额赔付券
+  settlement_id BIGINT REFERENCES settlements(id),
+  reversal_id BIGINT,
+  checks JSONB NOT NULL DEFAULT '[]'::jsonb,          -- 道闸/巡查/离场时间/防重 校验项
+  reject_reason TEXT,
+  reviewed_by BIGINT REFERENCES users(id),
+  reviewed_at TIMESTAMPTZ,
+  paid_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_refund_reservation ON refund_requests(reservation_id);
+CREATE INDEX IF NOT EXISTS idx_refund_driver ON refund_requests(driver_id);
+
+-- 结算后冲正单：申诉成立或退款审核通过后生成，冲正流水与原分账成对、借贷必须平衡
+CREATE TABLE IF NOT EXISTS settlement_reversals (
+  id BIGSERIAL PRIMARY KEY,
+  code TEXT UNIQUE NOT NULL,
+  settlement_id BIGINT NOT NULL REFERENCES settlements(id),   -- 原分账
+  reservation_id BIGINT NOT NULL REFERENCES reservations(id),
+  appeal_id BIGINT REFERENCES appeals(id),
+  refund_request_id BIGINT REFERENCES refund_requests(id),
+  kind TEXT NOT NULL CHECK (kind IN ('appeal_ruling','refund_approved')),
+  reason TEXT NOT NULL,
+  old_ruling TEXT,
+  new_ruling TEXT,
+  refund_to_driver NUMERIC(10,2) NOT NULL DEFAULT 0,  -- 本次实际退给车主现金
+  coupon_reissue NUMERIC(10,2) NOT NULL DEFAULT 0,
+  owner_clawback NUMERIC(10,2) NOT NULL DEFAULT 0,
+  property_clawback NUMERIC(10,2) NOT NULL DEFAULT 0,
+  platform_clawback NUMERIC(10,2) NOT NULL DEFAULT 0,
+  credit_target TEXT,
+  credit_delta INT NOT NULL DEFAULT 0,                 -- 冲正导致的信用净调整
+  detail JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_by BIGINT REFERENCES users(id),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_reversal_settlement ON settlement_reversals(settlement_id);
+CREATE INDEX IF NOT EXISTS idx_reversal_reservation ON settlement_reversals(reservation_id);
+
 CREATE TABLE IF NOT EXISTS patrol_logs (
   id BIGSERIAL PRIMARY KEY,
   spot_id BIGINT REFERENCES parking_spots(id),
@@ -237,3 +312,19 @@ CREATE TABLE IF NOT EXISTS patrol_logs (
 
 -- 幂等迁移：为旧版本库补充后续新增列
 ALTER TABLE settlements ADD COLUMN IF NOT EXISTS coupon_compensation NUMERIC(10,2) NOT NULL DEFAULT 0;
+-- 一笔服务可因申诉改判产生多版结算单（original -> recomputed），去掉一对一唯一约束
+ALTER TABLE settlements DROP CONSTRAINT IF EXISTS settlements_reservation_id_key;
+ALTER TABLE settlements ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'original'
+  CHECK (kind IN ('original','recomputed'));
+ALTER TABLE settlements ADD COLUMN IF NOT EXISTS supersedes_id BIGINT REFERENCES settlements(id);
+ALTER TABLE settlements ADD COLUMN IF NOT EXISTS reversal_count INT NOT NULL DEFAULT 0;
+ALTER TABLE ledger_entries ADD COLUMN IF NOT EXISTS reversal_id BIGINT REFERENCES settlement_reversals(id);
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'refund_requests_reversal_fk'
+  ) THEN
+    ALTER TABLE refund_requests ADD CONSTRAINT refund_requests_reversal_fk
+      FOREIGN KEY (reversal_id) REFERENCES settlement_reversals(id);
+  END IF;
+END $$;

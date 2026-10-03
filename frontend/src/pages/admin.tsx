@@ -5,12 +5,14 @@ import { WorkspaceShell } from '../App';
 import { accountLabel } from '../components';
 import { dt, money, Tag } from '../ui';
 import { OrderTable } from './owner';
+import { RefundsReviewTab } from './property';
 import { ReservationDetailModal } from './shared';
 
 type Session = any;
 const NAV = [
   { key: 'overview', label: '平台总览', icon: '📊' },
   { key: 'ledger', label: '分账监管', icon: '💰' },
+  { key: 'refunds', label: '退款与冲正', icon: '💸' },
   { key: 'orders', label: '订单追溯', icon: '🧾' },
   { key: 'dispatch', label: '调度总览', icon: '🌙' },
   { key: 'coupons', label: '补偿券发放', icon: '🎫' },
@@ -22,6 +24,7 @@ export function AdminWorkspace({ session }: { session: Session }) {
     <WorkspaceShell session={session} nav={NAV} active={tab} onNav={setTab}>
       {tab === 'overview' && <OverviewTab go={setTab} />}
       {tab === 'ledger' && <LedgerTab />}
+      {tab === 'refunds' && <RefundsReviewTab />}
       {tab === 'orders' && <OrdersTab />}
       {tab === 'dispatch' && <DispatchTab />}
       {tab === 'coupons' && <CouponTab />}
@@ -122,16 +125,17 @@ function LedgerTab() {
       <div className="card">
         <div className="table-wrap">
           <table>
-            <thead><tr><th>时间</th><th>结算单</th><th>车位</th><th>账户</th><th>借/贷</th><th>金额</th><th>摘要</th></tr></thead>
+            <thead><tr><th>时间</th><th>结算单</th><th>车位</th><th>账户</th><th>借/贷</th><th>金额</th><th>冲正单</th><th>摘要</th></tr></thead>
             <tbody>
               {(ledger ?? []).map((l) => (
-                <tr key={l.id}>
+                <tr key={l.id} style={l.reversal_code ? { background: 'rgba(207,51,51,0.06)' } : undefined}>
                   <td className="small">{dt(l.created_at)}</td>
-                  <td className="small mono">{l.settlement_code}<div className="small muted">{l.reservation_code}</div></td>
+                  <td className="small mono">{l.settlement_code}{l.settlement_kind === 'recomputed' && <Tag cls="purple" label="重做" />}<div className="small muted">{l.reservation_code}</div></td>
                   <td className="mono">{l.spot_code}</td>
                   <td>{accountLabel(l.account)}</td>
                   <td><Tag cls={l.direction === 'debit' ? 'amber' : 'green'} label={l.direction === 'debit' ? '借' : '贷'} /></td>
                   <td className="money">{money(l.amount)}</td>
+                  <td className="mono small" style={{ color: l.reversal_code ? 'var(--red)' : undefined }}>{l.reversal_code ?? '—'}</td>
                   <td className="small">{l.memo}</td>
                 </tr>
               ))}

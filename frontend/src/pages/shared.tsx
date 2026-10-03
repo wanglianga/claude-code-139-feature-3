@@ -158,8 +158,12 @@ export function AppealDetailModal({ id, onClose, onChanged }: { id: number; onCl
   const resettle = async () => {
     setErr('');
     try {
-      await api('POST', `/appeals/${id}/resettle`, {});
-      setMsg('分账已按终裁结果重算，信用分已冲销调整');
+      const r = await api('POST', `/appeals/${id}/resettle`, {});
+      if (r.idempotent) {
+        setMsg('当前分账已按该终裁口径落账，无需再次冲正（幂等返回，无重复冲销）');
+      } else {
+        setMsg(`已生成冲正单 ${r.reversal?.code ?? ''}：原分账红字冲销保留、按终裁重做一版，信用分已净调整`);
+      }
       onChanged?.();
     } catch (e: any) {
       setErr(e.message);

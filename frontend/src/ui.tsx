@@ -40,6 +40,9 @@ export const STATUS_TAG: Record<string, { label: string; cls: string }> = {
   upheld: { label: '申诉成立', cls: 'green' },
   rejected_appeal: { label: '申诉驳回', cls: 'red' },
 
+  // 退款申请
+  paid: { label: '已出账', cls: 'green' },
+
   normal: { label: '月租优先', cls: 'gray' },
   monthly: { label: '月租优先', cls: 'purple' },
 };

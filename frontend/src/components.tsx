@@ -36,8 +36,10 @@ export function SettlementView({ s }: { s: any }) {
         <MiniStat label="平台抽成 20%" value={money(s.platform_fee)} />
       </div>
       <div style={{ height: 10 }} />
+      <DaySplitView splits={s.splits} />
       <div className="btn-row">
         <RulingTag ruling={s.ruling} />
+        {s.kind === 'recomputed' && <Tag cls="purple" label="冲正重做版" />}
         {Number(s.credit_delta) !== 0 && (
           <Tag cls={Number(s.credit_delta) < 0 ? 'red' : 'green'}
             label={`信用 ${s.credit_target === 'driver' ? '车主' : s.credit_target === 'owner' ? '业主' : '物业'} ${s.credit_delta > 0 ? '+' : ''}${s.credit_delta}`} />
@@ -52,6 +54,7 @@ export function SettlementView({ s }: { s: any }) {
           </ul>
         </div>
       )}
+      <ReversalsView versions={s.versions} reversals={s.reversals} />
       <LedgerTable entries={s.ledger} />
     </div>
   );
@@ -62,6 +65,165 @@ function MiniStat({ label, value }: { label: string; value: string }) {
     <div className="stat" style={{ padding: '12px 14px' }}>
       <div className="label">{label}</div>
       <div className="value" style={{ fontSize: 20 }}>{value}</div>
+    </div>
+  );
+}
+
+// ---------- 跨日分账分段（按 UTC+8 结算日展示每段费用来源）----------
+const SOURCE_KIND_LABEL: Record<string, string> = {
+  parking: '停车',
+  charging: '充电',
+  overtime: '超时',
+  fine: '违约金',
+  coupon: '优惠券',
+  manual_release: '人工放行',
+  spot_change: '换位',
+  stranger: '异常占用',
+  owner_return: '业主回家',
+  weak_signal: '信号差',
+  share: '三方分成',
+  compensation: '补偿',
+};
+const SOURCE_KIND_CLS: Record<string, string> = {
+  parking: 'blue', charging: 'green', overtime: 'amber', fine: 'red', coupon: 'purple',
+  manual_release: 'cyan', spot_change: 'red', stranger: 'red', owner_return: 'amber',
+  weak_signal: 'amber', share: 'gray', compensation: 'green',
+};
+
+export function DaySplitView({ splits }: { splits: any[] }) {
+  if (!splits?.length) return null;
+  const sum = (k: string) => splits.reduce((a, s) => a + Number(s[k] ?? 0), 0);
+  const crossDay = splits.length > 1;
+  return (
+    <div style={{ marginTop: 14 }}>
+      <h3 style={{ fontSize: 14, marginBottom: 8 }}>
+        {crossDay ? `跨日分账（${splits.length} 个结算日 · UTC+8 日界 00:00）` : '结算日分段'}
+      </h3>
+      <div className="alert info" style={{ marginBottom: 10 }}>
+        {crossDay
+          ? '车辆凌晨离场跨越两个结算日：业主收益、物业服务费、平台抽成按实际占用时段拆分；换位/优惠券/人工放行按发生日落入对应分段。'
+          : '本单未跨结算日，全部费用归属同一结算日。'}
+      </div>
+      <div className="grid" style={{ gap: 10 }}>
+        {splits.map((sp, i) => (
+          <div className="card" key={i} style={{ marginTop: 0 }}>
+            <div className="btn-row" style={{ justifyContent: 'space-between' }}>
+              <div className="btn-row">
+                <Tag cls="blue" label={sp.settlement_date} />
+                <span className="small muted">{hm(sp.period_from)} ~ {hm(sp.period_to)}（{sp.duration_minutes} 分钟）</span>
+                {sp.spot_code && <span className="mono small muted">车位 {sp.spot_code}</span>}
+              </div>
+              <div className="btn-row">
+                <Tag cls="gray" label={`业主 ${money(sp.owner_income)}`} />
+                <Tag cls="gray" label={`物业 ${money(sp.property_fee)}`} />
+                <Tag cls="gray" label={`平台 ${money(sp.platform_fee)}`} />
+              </div>
+            </div>
+            <div className="fee-grid" style={{ marginTop: 8 }}>
+              <span className="row"><span className="muted">基础停车费</span><span className="money">{money(sp.base_fee)}</span></span>
+              <span className="row"><span className="muted">充电服务费</span><span className="money">{money(sp.charging_fee)}</span></span>
+              <span className="row"><span className="muted">访客超时费</span><span className="money">{money(sp.overtime_fee)}</span></span>
+              <span className="row"><span className="muted">错停违约金</span><span className="money">{money(sp.wrong_park_fine)}</span></span>
+              <span className="row"><span className="muted">优惠券抵扣</span><span className="money">{money(sp.coupon_discount)}</span></span>
+              <span className="row"><span className="muted">净服务费收入</span><span className="money">{money(sp.service_revenue)}</span></span>
+            </div>
+            {sp.sources?.length > 0 && (
+              <div style={{ marginTop: 8 }}>
+                <div className="small muted" style={{ marginBottom: 4 }}>本段费用来源：</div>
+                <div className="btn-row" style={{ flexWrap: 'wrap' }}>
+                  {sp.sources.map((x: any, j: number) => (
+                    <span key={j} className={`tag ${SOURCE_KIND_CLS[x.kind] ?? 'gray'}`} title={x.label}>
+                      {SOURCE_KIND_LABEL[x.kind] ?? x.kind}{x.amount != null ? ` ${money(x.amount)}` : ''}
+                    </span>
+                  ))}
+                </div>
+                <ul className="small muted" style={{ margin: '6px 0 0', paddingLeft: 18 }}>
+                  {sp.sources.map((x: any, j: number) => <li key={j}>{x.label}{x.at ? `（${dt(x.at)}）` : ''}</li>)}
+                </ul>
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+      {crossDay && (
+        <div className="small muted" style={{ marginTop: 8 }}>
+          分段合计：业主 {money(sum('owner_income'))} · 物业 {money(sum('property_fee'))} · 平台 {money(sum('platform_fee'))}
+          {' '}· 基础费 {money(sum('base_fee'))} · 券 {money(sum('coupon_discount'))}（与结算单合计严格相等）
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------- 结算版本与冲正单 ----------
+export function ReversalsView({ versions, reversals }: { versions?: any[]; reversals?: any[] }) {
+  if ((!versions || versions.length <= 1) && (!reversals || reversals.length <= 0)) return null;
+  return (
+    <div style={{ marginTop: 14 }}>
+      <h3 style={{ fontSize: 14, marginBottom: 8 }}>结算版本与冲正单（红字冲销不删原账）</h3>
+      {versions && versions.length > 1 && (
+        <div className="table-wrap" style={{ marginBottom: 10 }}>
+          <table>
+            <thead><tr><th>版本</th><th>类型</th><th>裁决</th><th>车主应付</th><th>退款</th><th>业主</th><th>物业</th><th>平台</th><th>冲正次数</th><th>时间</th></tr></thead>
+            <tbody>
+              {versions.map((v) => (
+                <tr key={v.id}>
+                  <td className="mono small">{v.code}</td>
+                  <td>{v.kind === 'recomputed' ? <Tag cls="purple" label="冲正重做" /> : <Tag cls="gray" label="原始分账" />}</td>
+                  <td><RulingTag ruling={v.ruling} /></td>
+                  <td className="money">{money(v.payable)}</td>
+                  <td className="money neg">{money(v.refund)}</td>
+                  <td className="money">{money(v.owner_income)}</td>
+                  <td className="money">{money(v.property_fee)}</td>
+                  <td className="money">{money(v.platform_fee)}</td>
+                  <td>{Number(v.reversal_count ?? 0)}</td>
+                  <td className="small muted">{dt(v.created_at)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {reversals?.map((rv) => (
+        <div className="alert info" key={rv.id} style={{ marginBottom: 8 }}>
+          <div className="btn-row" style={{ justifyContent: 'space-between' }}>
+            <div className="btn-row">
+              <Tag cls={rv.kind === 'refund_approved' ? 'green' : 'purple'}
+                label={rv.kind === 'refund_approved' ? '退款冲正' : '申诉成立冲正'} />
+              <span className="mono small">{rv.code}</span>
+              <RulingTag ruling={rv.new_ruling} />
+            </div>
+            <span className="small muted">{dt(rv.created_at)}</span>
+          </div>
+          <div className="small" style={{ marginTop: 6 }}>{rv.reason}</div>
+          <div className="btn-row" style={{ marginTop: 6, flexWrap: 'wrap' }}>
+            {Number(rv.refund_to_driver) > 0 && <Tag cls="green" label={`补退车主 ${money(rv.refund_to_driver)}`} />}
+            {Number(rv.coupon_reissue) > 0 && <Tag cls="purple" label={`补发赔付券 ${money(rv.coupon_reissue)}`} />}
+            {Number(rv.owner_clawback) > 0 && <Tag cls="amber" label={`追回业主 ${money(rv.owner_clawback)}`} />}
+            {Number(rv.property_clawback) > 0 && <Tag cls="amber" label={`追回物业 ${money(rv.property_clawback)}`} />}
+            {Number(rv.platform_clawback) > 0 && <Tag cls="red" label={`平台垫付 ${money(rv.platform_clawback)}`} />}
+            {Number(rv.credit_delta) !== 0 && <Tag cls={Number(rv.credit_delta) < 0 ? 'red' : 'green'} label={`信用净调整 ${rv.credit_delta}`} />}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ---------- 退款校验项（车主/物业共用）----------
+export function RefundChecks({ checks }: { checks: any[] }) {
+  if (!checks?.length) return null;
+  return (
+    <div className="grid" style={{ gap: 8 }}>
+      {checks.map((c, i) => (
+        <div key={i} className={`ticket-card ${c.passed === false ? 'open' : c.passed === true ? 'resolved' : 'notified'}`}>
+          <div className="ticket-head">
+            <span className="ticket-title">{c.label}</span>
+            {c.passed === true ? <Tag cls="green" label="支持" /> : c.passed === false ? <Tag cls="red" label="不支持/拦截" /> : <Tag cls="gray" label="事实记录" />}
+          </div>
+          <div className="ticket-desc">{c.detail}</div>
+        </div>
+      ))}
     </div>
   );
 }
@@ -93,8 +255,8 @@ export function LedgerTable({ entries }: { entries: any[] }) {
           </thead>
           <tbody>
             {entries.map((e, i) => (
-              <tr key={i}>
-                <td>{accountLabel(e.account)}</td>
+              <tr key={i} style={e.reversal_id ? { background: 'rgba(207,51,51,0.06)' } : undefined}>
+                <td>{accountLabel(e.account)}{e.reversal_id && <div className="small" style={{ color: 'var(--red)' }}>红字冲正</div>}</td>
                 <td>
                   <Tag cls={e.direction === 'debit' ? 'amber' : 'green'} label={e.direction === 'debit' ? '借方' : '贷方'} />
                 </td>
@@ -280,6 +442,9 @@ const EVENT_LABEL: Record<string, string> = {
   appeal_ruled: '申诉终裁',
   settlement_completed: '离场结算完成',
   settlement_recomputed: '分账重算',
+  settlement_reversed: '结算冲正',
+  refund_requested: '申请退款',
+  refund_reviewed: '退款审核',
   credit_adjusted: '信用调整',
   monthly_priority_conflict: '月租优先冲突',
 };

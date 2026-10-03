@@ -2,25 +2,30 @@ import { BadRequestException, Body, Controller, Get, Param, Post, Query, UseGuar
 import { AuthGuard, CurrentUser, Roles } from '../auth/auth.guard';
 import { JwtUser } from '../auth/auth.service';
 import { DbService } from '../database/db.service';
-import { Ruling, settlePrice, SettlementBreakdown } from '../domain/pricing';
+import { PRICING } from '../domain/pricing';
 import { buildSpotTimeline, TimelineIncident, TimelineOrder } from '../domain/timeline';
+import { SettlementService } from './settlement.service';
 
 class ExitDto {
   charge_kwh?: number;
+  charge_at?: string; // 充电发生时点（跨日订单归属结算日用，缺省取离场时间）
   exit_at?: string; // 道闸时钟/离场补录时间
 }
 
 @Controller()
 @UseGuards(AuthGuard)
 export class SettlementController {
-  constructor(private db: DbService) {}
+  constructor(
+    private db: DbService,
+    private settlements: SettlementService,
+  ) {}
 
   // 离场结算：把计费规则、异常、申诉裁决合并清算
   @Post('reservations/:id/exit')
   async exit(@CurrentUser() user: JwtUser, @Param('id') id: string, @Body() dto: ExitDto) {
     return this.db.withTx(async (c) => {
       const rq = await c.query(
-        `SELECT r.*, s.hourly_rate, s.overnight_cap, s.near_charger, s.owner_id,
+        `SELECT r.*, s.hourly_rate, s.overnight_cap, s.near_charger, s.owner_id, s.code AS spot_code,
                 v.is_new_energy, v.plate AS vplate
          FROM reservations r
          JOIN parking_spots s ON s.id=r.spot_id
@@ -39,34 +44,23 @@ export class SettlementController {
         [id, exitAt],
       );
 
-      const breakdown = await this.computeBreakdown(c, r, exitAt, dto.charge_kwh ?? 0);
-      const settlement = await this.persistSettlement(c, r, exitAt, breakdown);
-
-      // 信用分
-      if (breakdown.creditTarget !== 'none' && breakdown.creditDelta !== 0) {
-        const targetId =
-          breakdown.creditTarget === 'owner'
-            ? r.owner_id
-            : breakdown.creditTarget === 'property'
-              ? null
-              : r.driver_id;
-        if (targetId) {
-          await c.query(`UPDATE users SET credit_score=GREATEST(0, credit_score + $1) WHERE id=$2`, [
-            breakdown.creditDelta,
-            targetId,
-          ]);
-        }
+      // 充电会话留痕（跨日订单按充电发生时点归属结算日）
+      if (dto.charge_kwh && dto.charge_kwh > 0) {
         await c.query(
-          `INSERT INTO service_events(reservation_id, spot_id, type, actor_role, detail)
-           VALUES ($1,$2,'credit_adjusted',$3,$4)`,
+          `INSERT INTO service_events(reservation_id, spot_id, type, actor_id, actor_role, plate, occurred_at, detail)
+           VALUES ($1,$2,'charging_session',$3,$4,$5,COALESCE($6::timestamptz, now()),$7)`,
           [
-            id,
-            r.spot_id,
-            user.role,
-            JSON.stringify({ target: breakdown.creditTarget, delta: breakdown.creditDelta }),
+            id, r.spot_id, user.sub, user.role, r.plate,
+            dto.charge_at ? new Date(dto.charge_at) : exitAt,
+            JSON.stringify({ kwh: dto.charge_kwh }),
           ],
         );
       }
+
+      const breakdown = await this.settlements.computeBreakdown(c, r, exitAt, dto.charge_kwh ?? 0);
+      const settlement = await this.settlements.persistSettlement(c, r, exitAt, breakdown);
+
+      await this.settlements.applyCredit(c, r, breakdown.creditTarget, breakdown.creditDelta, user);
 
       await c.query(
         `INSERT INTO service_events(reservation_id, spot_id, type, actor_id, actor_role, plate, detail)
@@ -77,7 +71,12 @@ export class SettlementController {
           user.sub,
           user.role,
           r.plate,
-          JSON.stringify({ payable: breakdown.payable, refund: breakdown.refund, exit_charge: breakdown.exitCharge }),
+          JSON.stringify({
+            payable: breakdown.payable,
+            refund: breakdown.refund,
+            exit_charge: breakdown.exitCharge,
+            day_splits: breakdown.splits.length,
+          }),
         ],
       );
 
@@ -89,7 +88,7 @@ export class SettlementController {
   @Get('reservations/:id/quote')
   async quote(@CurrentUser() user: JwtUser, @Param('id') id: string, @Query('charge_kwh') kwh?: string) {
     const rq = await this.db.query(
-      `SELECT r.*, s.hourly_rate, s.overnight_cap, s.near_charger, s.owner_id, v.is_new_energy
+      `SELECT r.*, s.hourly_rate, s.overnight_cap, s.near_charger, s.owner_id, s.code AS spot_code, v.is_new_energy
        FROM reservations r
        JOIN parking_spots s ON s.id=r.spot_id
        JOIN vehicles v ON v.id=r.vehicle_id
@@ -98,30 +97,51 @@ export class SettlementController {
     );
     const r = rq.rows[0];
     if (!r) throw new BadRequestException('预约不存在');
-    return this.computeBreakdown(this.db, r, new Date(), Number(kwh ?? 0));
+    return this.settlements.computeBreakdown(this.db, r, new Date(), Number(kwh ?? 0));
   }
 
   @Get('reservations/:id/settlement')
   async settlement(@Param('id') id: string) {
-    const sq = await this.db.query(`SELECT * FROM settlements WHERE reservation_id=$1`, [id]);
+    const sq = await this.db.query(
+      `SELECT * FROM settlements WHERE reservation_id=$1 ORDER BY id DESC LIMIT 1`,
+      [id],
+    );
     if (!sq.rows[0]) return null;
-    const ledger = await this.db.query(`SELECT * FROM ledger_entries WHERE settlement_id=$1 ORDER BY id`, [sq.rows[0].id]);
-    return { ...sq.rows[0], ledger: ledger.rows };
+    const ledger = await this.db.query(
+      `SELECT * FROM ledger_entries WHERE settlement_id=$1 ORDER BY id`,
+      [sq.rows[0].id],
+    );
+    const splits = await this.db.query(
+      `SELECT id, settlement_id, settlement_date::text AS settlement_date, period_from, period_to,
+              duration_minutes, spot_code, base_fee, charging_fee, overtime_fee, wrong_park_fine,
+              coupon_discount, service_revenue, owner_income, property_fee, platform_fee, sources, created_at
+       FROM settlement_day_splits WHERE settlement_id=$1 ORDER BY period_from`,
+      [sq.rows[0].id],
+    );
+    const reversals = await this.db.query(
+      `SELECT * FROM settlement_reversals WHERE reservation_id=$1 ORDER BY id`,
+      [id],
+    );
+    const versions = await this.db.query(
+      `SELECT id, code, kind, ruling, payable, refund, owner_income, property_fee, platform_fee,
+              supersedes_id, reversal_count, created_at
+       FROM settlements WHERE reservation_id=$1 ORDER BY id`,
+      [id],
+    );
+    return { ...sq.rows[0], ledger: ledger.rows, splits: splits.rows, reversals: reversals.rows, versions: versions.rows };
   }
 
-  // 申诉终裁后重算分账（物业/管理员）
+  // 申诉终裁后冲正重算（物业/管理员）：不再删除原分账，而是红字冲销 + 重做并关联原分账
   @Roles('property', 'admin')
   @Post('appeals/:id/resettle')
   async resettle(@CurrentUser() user: JwtUser, @Param('id') id: string) {
     return this.db.withTx(async (c) => {
-      const aq = await c.query(
-        `SELECT * FROM appeals WHERE id=$1 AND status='closed'`,
-        [id],
-      );
+      const aq = await c.query(`SELECT * FROM appeals WHERE id=$1 AND status='closed'`, [id]);
       const appeal = aq.rows[0];
       if (!appeal) throw new BadRequestException('申诉未终裁，不能重算');
+
       const rq = await c.query(
-        `SELECT r.*, s.hourly_rate, s.overnight_cap, s.near_charger, s.owner_id, v.is_new_energy
+        `SELECT r.*, s.hourly_rate, s.overnight_cap, s.near_charger, s.owner_id, s.code AS spot_code, v.is_new_energy
          FROM reservations r
          JOIN parking_spots s ON s.id=r.spot_id
          JOIN vehicles v ON v.id=r.vehicle_id
@@ -129,38 +149,43 @@ export class SettlementController {
         [appeal.reservation_id],
       );
       const r = rq.rows[0];
-      const old = await c.query(`SELECT * FROM settlements WHERE reservation_id=$1`, [r.id]);
-      // 重算前反向冲销旧结算对信用分的影响（仅系统内账号：车主/业主）
-      if (old.rows[0] && old.rows[0].credit_delta !== 0 && ['driver', 'owner'].includes(old.rows[0].credit_target)) {
-        const oldTargetId = old.rows[0].credit_target === 'owner' ? r.owner_id : r.driver_id;
-        await c.query(
-          `UPDATE users SET credit_score=GREATEST(0, credit_score - $1) WHERE id=$2`,
-          [old.rows[0].credit_delta, oldTargetId],
+
+      const old = await this.settlements.latestSettlement(c, r.id);
+      if (!old) throw new BadRequestException('订单尚未离场结算，无法冲正；请先离场结算');
+
+      // 幂等：分账金额只取决于裁决。当前生效分账的裁决已等于终裁（离场时已采用或已冲正重做），
+      // 则资金口径无需再变，直接返回当前版本，避免重复冲销。
+      if ((old.ruling ?? null) === (appeal.ruling ?? null)) {
+        const ledger = await c.query(`SELECT * FROM ledger_entries WHERE settlement_id=$1 ORDER BY id`, [old.id]);
+        const splits = await c.query(
+          `SELECT * FROM settlement_day_splits WHERE settlement_id=$1 ORDER BY period_from`,
+          [old.id],
         );
+        return { ...old, ledger: ledger.rows, splits: splits.rows, idempotent: true };
       }
-      if (old.rows[0]) await c.query(`DELETE FROM settlements WHERE id=$1`, [old.rows[0].id]);
 
-      const breakdown = await this.computeBreakdown(c, r, r.gate_exit_at ?? new Date(), 0, appeal.ruling, appeal.id);
-      const settlement = await this.persistSettlement(c, r, r.gate_exit_at ?? new Date(), breakdown, appeal.id, appeal.ruling);
+      const exitAt = r.gate_exit_at ?? new Date();
+      // 重算必须沿用结算时同一事实：由旧充电费反推 kWh，避免因事件缺失改变账单
+      const kwh = Number(old.charging_fee ?? 0) > 0 ? Number(old.charging_fee) / PRICING.chargerPricePerKwh : 0;
+      const oldBreakdown = await this.settlements.computeBreakdown(c, r, exitAt, kwh, old.ruling ?? null);
+      const newBreakdown = await this.settlements.computeBreakdown(c, r, exitAt, kwh, appeal.ruling);
 
-      // 终裁后信用分修正：先回滚旧的影响再施加新的（简化：直接按差值调整）
-      if (breakdown.creditDelta !== 0) {
-        const targetId = breakdown.creditTarget === 'owner' ? r.owner_id : r.driver_id;
-        await c.query(`UPDATE users SET credit_score=GREATEST(0, credit_score + $1) WHERE id=$2`, [
-          breakdown.creditDelta,
-          targetId,
-        ]);
-      }
-      await c.query(
-        `INSERT INTO service_events(reservation_id, spot_id, type, actor_id, actor_role, detail)
-         VALUES ($1,$2,'settlement_recomputed',$3,$4,$5)`,
-        [r.id, r.spot_id, user.sub, user.role, JSON.stringify({ appeal_id: id, ruling: appeal.ruling })],
-      );
-      return settlement;
+      const result = await this.settlements.createReversal(c, {
+        r,
+        oldSettlement: old,
+        oldBreakdown,
+        newBreakdown,
+        kind: 'appeal_ruling',
+        reason: appeal.ruling_note ?? `申诉 ${appeal.code} 终裁成立（${appeal.ruling}），原分账冲正后按终裁重做`,
+        appealId: appeal.id,
+        user,
+        couponReissue: newBreakdown.couponCompensation > 0 ? newBreakdown.couponCompensation : undefined,
+      });
+      return { ...result.settlement, reversal: result.reversal, plan: result.plan };
     });
   }
 
-  // 分账流水总览（物业/管理员/业主看自己车位）
+  // 分账流水总览（物业/管理员/业主看自己车位；含冲正红字流水）
   @Get('ledger')
   async ledger(
     @CurrentUser() user: JwtUser,
@@ -188,13 +213,15 @@ export class SettlementController {
     }
     return this.db
       .query(
-        `SELECT l.*, st.code AS settlement_code, r.code AS reservation_code, r.spot_id, sp.code AS spot_code
+        `SELECT l.*, st.code AS settlement_code, st.kind AS settlement_kind, rv.code AS reversal_code,
+                r.code AS reservation_code, r.spot_id, sp.code AS spot_code
          FROM ledger_entries l
          JOIN settlements st ON st.id=l.settlement_id
          JOIN reservations r ON r.id=st.reservation_id
          JOIN parking_spots sp ON sp.id=st.spot_id
+         LEFT JOIN settlement_reversals rv ON rv.id=l.reversal_id
          WHERE ${where}
-         ORDER BY l.id DESC LIMIT 300`,
+         ORDER BY l.id DESC LIMIT 500`,
         params,
       )
       .then((q) => q.rows);
@@ -218,11 +245,13 @@ export class SettlementController {
       nightStart = new Date(startQ);
       nightEnd = new Date(endQ);
     } else {
-      const base = date ? new Date(`${date}T18:00:00`) : (() => {
-        const d = new Date();
-        d.setHours(18, 0, 0, 0);
-        return d;
-      })();
+      const base = date
+        ? new Date(`${date}T18:00:00`)
+        : (() => {
+            const d = new Date();
+            d.setHours(18, 0, 0, 0);
+            return d;
+          })();
       nightStart = base;
       nightEnd = new Date(base.getTime() + 15 * 3600000);
     }
@@ -236,13 +265,14 @@ export class SettlementController {
                 WHERE e.reservation_id=r.id AND e.type IN ('parking_confirmed','gate_entry')) AS dummy
        FROM reservations r
        JOIN users u ON u.id=r.driver_id
-       LEFT JOIN settlements st ON st.reservation_id=r.id
+       LEFT JOIN LATERAL (
+         SELECT * FROM settlements WHERE reservation_id=r.id ORDER BY id DESC LIMIT 1
+       ) st ON true
        WHERE r.spot_id=$1 AND r.start_at < $2 AND r.end_at > $3
        ORDER BY r.start_at`,
       [id, nightEnd, nightStart],
     );
 
-    // usable_from：识别成功/可使用时间点（被陌生车占用则以占用解除时间为准，简化用停车确认时间）
     const orders: TimelineOrder[] = oq.rows.map((o: any) => ({
       id: o.id,
       code: o.code,
@@ -294,121 +324,5 @@ export class SettlementController {
       incidents,
       segments,
     };
-  }
-
-  // ---- 核心：组装分账输入 ----
-  private async computeBreakdown(
-    client: any,
-    r: any,
-    exitAt: Date,
-    chargeKwh: number,
-    forcedRuling?: Ruling | null,
-    appealId?: number,
-  ): Promise<SettlementBreakdown> {
-    // 该笔服务关联的异常
-    const iq = await client.query(
-      `SELECT type, created_at, resolved_at, detail FROM incident_tickets
-       WHERE reservation_id=$1 ORDER BY created_at`,
-      [r.id],
-    );
-    const incidents = iq.rows.map((i: any) => ({
-      type: i.type,
-      started_at: i.created_at,
-      resolved_at: i.resolved_at,
-      detail: i.detail ?? {},
-    }));
-
-    // 申诉裁决（优先使用传入的终裁，其次取已关闭申诉）
-    let ruling: Ruling | null = forcedRuling ?? null;
-    if (!ruling) {
-      const aq = await client.query(
-        `SELECT ruling FROM appeals WHERE reservation_id=$1 AND status='closed' ORDER BY ruled_at DESC NULLS LAST LIMIT 1`,
-        [r.id],
-      );
-      ruling = aq.rows[0]?.ruling ?? null;
-    }
-
-    // 优惠券抵扣（预约时已核销，这里从 coupon 关联反查）
-    const cq = await client.query(
-      `SELECT COALESCE(SUM(amount),0) AS amount FROM coupons WHERE used_reservation_id=$1`,
-      [r.id],
-    );
-    const couponAmount = Number(cq.rows[0].amount);
-
-    // usable_from：若存在陌生车占用，为占用解除时间；否则入场/停车确认时间
-    let usableFrom = r.parking_confirmed_at ?? r.gate_entry_at ?? r.start_at;
-    const stranger = iq.rows.find((i: any) => ['stranger_occupy', 'ice_occupy_charger'].includes(i.type));
-    if (stranger?.resolved_at && new Date(stranger.resolved_at) > new Date(usableFrom)) {
-      usableFrom = stranger.resolved_at;
-    }
-
-    // 充电量结算优先使用已持久化的值（重算场景）
-    let kwh = chargeKwh;
-    if (!kwh) {
-      const detail = await client.query(
-        `SELECT detail FROM service_events WHERE reservation_id=$1 AND type='charging_session' ORDER BY id DESC LIMIT 1`,
-        [r.id],
-      );
-      kwh = Number(detail.rows[0]?.detail?.kwh ?? 0);
-    }
-
-    return settlePrice({
-      reservedStart: r.start_at,
-      reservedEnd: r.end_at,
-      actualEntry: r.gate_entry_at ?? r.start_at,
-      actualExit: exitAt,
-      usableFrom,
-      hourlyRate: Number(r.hourly_rate),
-      overnightCap: r.overnight_cap != null ? Number(r.overnight_cap) : null,
-      isNewEnergy: r.is_new_energy,
-      chargeKwh: kwh,
-      incidents,
-      ruling,
-      couponAmount,
-      prepaid: Number(r.estimated_fee && couponAmount ? Math.max(0, Number(r.estimated_fee) - couponAmount) : (r.estimated_fee ?? 0)),
-    });
-  }
-
-  private async persistSettlement(
-    c: any,
-    r: any,
-    exitAt: Date,
-    b: SettlementBreakdown,
-    appealId?: number,
-    ruling?: Ruling | null,
-  ) {
-    const code = 'ST' + Date.now().toString(36).toUpperCase() + Math.floor(Math.random() * 1000).toString(36).toUpperCase();
-    const ins = await c.query(
-      `INSERT INTO settlements(code, reservation_id, spot_id, actual_entry_at, actual_exit_at, usable_from,
-         duration_minutes, base_fee, charging_fee, overtime_fee, wrong_park_fine,
-         coupon_discount, abnormal_compensation, coupon_compensation, owner_compensation, prepaid, refund, exit_charge, payable,
-         owner_income, property_fee, platform_fee, owner_share, property_share, platform_share,
-         credit_target, credit_delta, appeal_id, ruling, detail)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
-               $19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30)
-       RETURNING *`,
-      [
-        code, r.id, r.spot_id, b.actualEntryAt, b.actualExitAt, b.usableFrom,
-        b.durationMinutes, b.baseFee, b.chargingFee, b.overtimeFee, b.wrongParkFine,
-        b.couponDiscount, b.abnormalCompensation, b.couponCompensation, b.ownerCompensation, b.prepaid, b.refund, b.exitCharge, b.payable,
-        b.ownerIncome, b.propertyFee, b.platformFee, b.ownerShare, b.propertyShare, b.platformShare,
-        b.creditTarget, b.creditDelta, appealId ?? null, ruling ?? b.ruling,
-        JSON.stringify({ notes: b.notes }),
-      ],
-    );
-    const settlement = ins.rows[0];
-    await c.query(`UPDATE reservations SET settled_at=now(), settlement_id=$1 WHERE id=$2`, [
-      settlement.id,
-      r.id,
-    ]);
-    for (const e of b.ledger) {
-      await c.query(
-        `INSERT INTO ledger_entries(settlement_id, account, direction, amount, memo)
-         VALUES ($1,$2,$3,$4,$5)`,
-        [settlement.id, e.account === 'owner' ? `owner:${r.owner_id}` : e.account, e.direction, e.amount, e.memo],
-      );
-    }
-    const ledger = await c.query(`SELECT * FROM ledger_entries WHERE settlement_id=$1 ORDER BY id`, [settlement.id]);
-    return { ...settlement, ledger: ledger.rows, notes: b.notes };
   }
 }

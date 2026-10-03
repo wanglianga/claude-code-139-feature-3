@@ -1,16 +1,17 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { api, qs } from '../api';
 import { useLoader } from '../hooks';
 import { WorkspaceShell } from '../App';
-import { dt, money, Tag } from '../ui';
+import { dt, money, Modal, Tag } from '../ui';
 import { OrderTable } from './owner';
 import { AppealDetailModal, ReservationDetailModal } from './shared';
-import { SettlementView } from '../components';
+import { RefundChecks, SettlementView } from '../components';
 
 type Session = any;
 const NAV = [
   { key: 'browse', label: '找车位预约', icon: '🔍' },
   { key: 'active', label: '我的停车服务', icon: '🚗' },
+  { key: 'refunds', label: '退款售后', icon: '💸' },
   { key: 'vehicles', label: '车辆与优惠券', icon: '🎫' },
   { key: 'appeals', label: '错停申诉', icon: '⚖️' },
 ];
@@ -21,6 +22,7 @@ export function DriverWorkspace({ session }: { session: Session }) {
     <WorkspaceShell session={session} nav={NAV} active={tab} onNav={setTab}>
       {tab === 'browse' && <BrowseTab />}
       {tab === 'active' && <OrdersTab />}
+      {tab === 'refunds' && <RefundsTab />}
       {tab === 'vehicles' && <VehiclesTab />}
       {tab === 'appeals' && <AppealsTab />}
     </WorkspaceShell>
@@ -353,6 +355,132 @@ function ServiceActionModal({ order, onClose, onChanged, onSettlement }: any) {
         </div>
       </div>
     </div>
+  );
+}
+
+// ---------- 退款售后 ----------
+function RefundsTab() {
+  const { data: refunds, reload } = useLoader<any[]>('/refunds');
+  const { data: orders } = useLoader<any[]>('/reservations?scope=mine');
+  const [creating, setCreating] = useState(false);
+  const [openId, setOpenId] = useState<number | null>(null);
+
+  return (
+    <div>
+      <PageHead title="退款售后" desc="平台按道闸记录、物业巡查与离场时间三类客观证据核定可退金额；券抵扣不退现金、改发等额赔付券；同一笔分账防重复冲销" right={
+        <button className="btn" onClick={() => setCreating(true)}>申请退款</button>
+      } />
+      <div className="card">
+        {(refunds ?? []).length === 0 && <div className="empty">暂无退款申请</div>}
+        <div className="table-wrap">
+          <table>
+            <thead><tr><th>申请单</th><th>订单/车位</th><th>事由</th><th>申请/核定</th><th>补发券</th><th>状态</th><th>冲正单</th><th></th></tr></thead>
+            <tbody>
+              {(refunds ?? []).map((x) => (
+                <tr key={x.id}>
+                  <td className="mono small">{x.code}<div className="small muted">{dt(x.created_at)}</div></td>
+                  <td>{x.spot_code}<div className="small muted mono">{x.reservation_code} · {x.plate}</div></td>
+                  <td className="small" style={{ maxWidth: 220 }}>{x.reason}{x.reject_reason ? <div className="small" style={{ color: 'var(--red)' }}>驳回：{x.reject_reason}</div> : null}</td>
+                  <td className="small">{money(x.requested_amount)}<div className="text-green">核定 {money(x.validated_amount)}</div></td>
+                  <td>{Number(x.coupon_reissue) > 0 ? money(x.coupon_reissue) : '—'}</td>
+                  <td><Tag status={x.status} /></td>
+                  <td className="mono small">{x.reversal_code ?? '—'}</td>
+                  <td><button className="btn sm gray" onClick={() => setOpenId(x.id)}>校验详情</button></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      {creating && <CreateRefundModal orders={orders ?? []} onClose={() => setCreating(false)} onDone={() => { setCreating(false); reload(); }} />}
+      {openId != null && <RefundCheckModal id={openId} onClose={() => { setOpenId(null); reload(); }} />}
+    </div>
+  );
+}
+
+function RefundCheckModal({ id, onClose }: { id: number; onClose: () => void }) {
+  const [d, setD] = useState<any>(null);
+  useEffect(() => { api('GET', `/refunds/${id}`).then(async (x) => {
+    // checks 已随申请返回（列表/详情行里直接带 checks 列）
+    setD(x);
+  }).catch(() => setD({})); }, [id]);
+  return (
+    <Modal title={`退款校验详情 ${d?.code ?? ''}`} onClose={onClose}>
+      {!d ? <div className="empty">加载中…</div> : (
+        <div>
+          <div className="alert info" style={{ whiteSpace: 'pre-wrap' }}>
+            {d.reason}{d.reject_reason ? `\n审核说明：${d.reject_reason}` : ''}
+            {d.reversal_code ? `\n冲正单：${d.reversal_code}` : ''}
+          </div>
+          <RefundChecks checks={d.checks} />
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+function CreateRefundModal({ orders, onClose, onDone }: any) {
+  const eligible = orders.filter((o: any) => ['admitted', 'in_garage', 'completed'].includes(o.status));
+  const [reservationId, setReservationId] = useState<number | ''>(eligible[0]?.id ?? '');
+  const [reason, setReason] = useState('');
+  const [amount, setAmount] = useState<number | ''>('');
+  const [err, setErr] = useState('');
+  const [result, setResult] = useState<any>(null);
+
+  const submit = async () => {
+    setErr('');
+    try {
+      const r = await api('POST', `/reservations/${reservationId}/refunds`, {
+        reason,
+        amount: amount === '' ? undefined : Number(amount),
+      });
+      setResult(r);
+    } catch (e: any) { setErr(e.message); }
+  };
+
+  return (
+    <Modal title="申请退款" onClose={onClose}>
+      {!result ? (
+        <div>
+          {err && <div className="alert error">{err}</div>}
+          <div className="field">
+            <label>关联停车服务单</label>
+            <select value={reservationId} onChange={(e) => setReservationId(Number(e.target.value))}>
+              {eligible.map((o: any) => <option key={o.id} value={o.id}>{o.code} · {o.spot_code} · {o.plate} · {dt(o.start_at)}</option>)}
+            </select>
+          </div>
+          <div className="field">
+            <label>退款事由（道闸/巡查/离场时间将作为客观证据自动核验）</label>
+            <textarea value={reason} onChange={(e) => setReason(e.target.value)} placeholder="如：到场发现车位被陌生车占用 / 缴费设备故障 / 业主临时回家被要求挪车…" />
+          </div>
+          <div className="field">
+            <label>申请退款金额（元，可不填，由平台核定）</label>
+            <input type="number" step="0.5" value={amount} onChange={(e) => setAmount(e.target.value === '' ? '' : Number(e.target.value))} />
+          </div>
+          <div className="alert info">提交后平台依据 ① 道闸入场/离场记录 ② 物业巡查记录 ③ 离场时间与预约结束时间 核定可退现金；原优惠券抵扣部分补发等额赔付券。</div>
+          <button className="btn" disabled={!reason || reservationId === ''} onClick={submit}>提交退款申请</button>
+        </div>
+      ) : (
+        <div>
+          <div className="alert ok">
+            申请已受理（{result.refund.code}），系统校验结论：
+            {result.validation.decision === 'eligible' ? ' 符合退款条件，待物业/平台审核出账'
+              : result.validation.decision === 'awaiting_exit' ? ' 车辆尚未离场，离场结算后核定'
+              : result.validation.decision === 'duplicate' ? ' 已有处理中的申请'
+              : ' 现有证据暂不支持额外退款（可先发起错停申诉）'}
+          </div>
+          <RefundChecks checks={result.validation.checks} />
+          {(result.validation.reasons ?? []).length > 0 && (
+            <ul className="small muted" style={{ marginTop: 8 }}>{result.validation.reasons.map((x: string, i: number) => <li key={i}>{x}</li>)}</ul>
+          )}
+          <div style={{ marginTop: 10 }} className="btn-row">
+            <Tag cls="green" label={`核定可退现金 ${money(result.validation.validatedAmount)}`} />
+            <Tag cls="purple" label={`应补发赔付券 ${money(result.validation.couponReissue)}`} />
+          </div>
+          <button className="btn" style={{ marginTop: 12 }} onClick={onDone}>完成</button>
+        </div>
+      )}
+    </Modal>
   );
 }
 

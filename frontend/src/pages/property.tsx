@@ -2,8 +2,9 @@ import { useEffect, useState } from 'react';
 import { api } from '../api';
 import { useLoader } from '../hooks';
 import { WorkspaceShell } from '../App';
-import { dt, INCIDENT_LABEL, Tag } from '../ui';
+import { dt, INCIDENT_LABEL, money, Modal, Tag } from '../ui';
 import { OrderTable } from './owner';
+import { RefundChecks } from '../components';
 import { AppealDetailModal, ReservationDetailModal } from './shared';
 
 type Session = any;
@@ -13,6 +14,7 @@ const NAV = [
   { key: 'dispatch', label: '夜间调度看板', icon: '🌙' },
   { key: 'patrol', label: '巡查登记', icon: '🔦' },
   { key: 'appeals', label: '申诉裁决', icon: '⚖️' },
+  { key: 'refunds', label: '退款审核', icon: '💸' },
   { key: 'orders', label: '订单追溯', icon: '🧾' },
 ];
 
@@ -25,6 +27,7 @@ export function PropertyWorkspace({ session }: { session: Session }) {
       {tab === 'dispatch' && <DispatchTab />}
       {tab === 'patrol' && <PatrolTab />}
       {tab === 'appeals' && <AppealsTab />}
+      {tab === 'refunds' && <RefundsReviewTab />}
       {tab === 'orders' && <OrdersTab />}
     </WorkspaceShell>
   );
@@ -404,6 +407,158 @@ function AppealsTab() {
       </div>
       {open && <AppealDetailModal id={open} onClose={() => setOpen(null)} onChanged={reload} />}
     </div>
+  );
+}
+
+// ---------- 退款审核 ----------
+export function RefundsReviewTab() {
+  const { data: refunds, reload } = useLoader<any[]>('/refunds');
+  const [openId, setOpenId] = useState<number | null>(null);
+  const pending = (refunds ?? []).filter((x) => x.status === 'pending');
+  return (
+    <div>
+      <PageHead title="退款审核" desc="依据道闸入场/离场记录、物业巡查、离场时间三类客观证据核定；通过即生成与原分账关联的冲正单，已出账申请不可重复冲销" />
+      <div className="card">
+        <h3>待审核（{pending.length}）</h3>
+        {pending.length === 0 && <div className="empty">没有待审核退款申请</div>}
+        <div className="table-wrap">
+          <table>
+            <thead><tr><th>申请单</th><th>车主</th><th>订单/车位</th><th>事由</th><th>申请额</th><th>系统核定</th><th></th></tr></thead>
+            <tbody>
+              {pending.map((x) => (
+                <tr key={x.id}>
+                  <td className="mono small">{x.code}<div className="small muted">{dt(x.created_at)}</div></td>
+                  <td>{x.driver_name}</td>
+                  <td>{x.spot_code}<div className="small muted mono">{x.reservation_code} · {x.plate}</div></td>
+                  <td className="small" style={{ maxWidth: 260 }}>{x.reason}</td>
+                  <td className="money">{money(x.requested_amount)}</td>
+                  <td><span className="text-green">{money(x.validated_amount)}</span>{Number(x.coupon_reissue) > 0 && <div className="small">补发券 {money(x.coupon_reissue)}</div>}</td>
+                  <td><button className="btn sm" onClick={() => setOpenId(x.id)}>核验/出账</button></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div className="card">
+        <h3>全部退款申请</h3>
+        <div className="table-wrap">
+          <table>
+            <thead><tr><th>申请单</th><th>订单</th><th>事由</th><th>核定/出账</th><th>券</th><th>状态</th><th>冲正单</th></tr></thead>
+            <tbody>
+              {(refunds ?? []).map((x) => (
+                <tr key={x.id}>
+                  <td className="mono small">{x.code}</td>
+                  <td className="small mono">{x.reservation_code}</td>
+                  <td className="small" style={{ maxWidth: 220 }}>{x.reason}{x.reject_reason ? <div className="small" style={{ color: 'var(--red)' }}>{x.reject_reason}</div> : null}</td>
+                  <td className="money small">{money(x.validated_amount)}</td>
+                  <td className="small">{Number(x.coupon_reissue) > 0 ? money(x.coupon_reissue) : '—'}</td>
+                  <td><Tag status={x.status} /></td>
+                  <td className="mono small">{x.reversal_code ?? '—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      {openId != null && <RefundApproveModal id={openId} onClose={() => { setOpenId(null); reload(); }} />}
+    </div>
+  );
+}
+
+function RefundApproveModal({ id, onClose }: { id: number; onClose: () => void }) {
+  const [d, setD] = useState<any>(null);
+  const [ruling, setRuling] = useState('');
+  const [note, setNote] = useState('');
+  const [forceCash, setForceCash] = useState<number | ''>('');
+  const [forceCoupon, setForceCoupon] = useState<number | ''>('');
+  const [msg, setMsg] = useState('');
+  const [err, setErr] = useState('');
+
+  const load = () => api('GET', `/refunds/${id}`).then(setD).catch((e) => setErr(e.message));
+  useEffect(() => { load(); }, [id]);
+
+  const approve = async () => {
+    setErr(''); setMsg('');
+    try {
+      const r = await api('POST', `/refunds/${id}/approve`, {
+        ruling: ruling || undefined,
+        note: note || undefined,
+        force_cash: forceCash === '' ? undefined : Number(forceCash),
+        force_coupon: forceCoupon === '' ? undefined : Number(forceCoupon),
+      });
+      setMsg(r.outcome === 'cancelled_no_settlement'
+        ? '未入场：订单已取消、优惠券已释放，无资金流水'
+        : `已出账，冲正单 ${r.reversal?.code ?? ''}：补退现金 ${money(r.reversal?.refund_to_driver ?? 0)}、补发券 ${money(r.reversal?.coupon_reissue ?? 0)}`);
+      await load();
+    } catch (e: any) { setErr(e.message); }
+  };
+  const reject = async () => {
+    setErr('');
+    try {
+      await api('POST', `/refunds/${id}/reject`, { reason: note || undefined });
+      onClose();
+    } catch (e: any) { setErr(e.message); }
+  };
+
+  return (
+    <Modal wide title={`退款核验与出账 · ${d?.code ?? ''}`} onClose={onClose}>
+      {!d ? <div className="empty">加载中…</div> : (
+        <div className="grid grid-2">
+          <div>
+            <div className="alert info">
+              {d.driver_name} · {d.plate} · 车位 {d.spot_code} · {d.reservation_code}
+              <div style={{ marginTop: 6 }}>申请事由：{d.reason}</div>
+              <div style={{ marginTop: 6 }}>申请 {money(d.requested_amount)} · 系统核定现金 {money(d.validated_amount)} · 补发券 {money(d.coupon_reissue)}</div>
+            </div>
+            <RefundChecks checks={d.checks} />
+          </div>
+          <div>
+            {msg && <div className="alert ok">{msg}</div>}
+            {err && <div className="alert error">{err}</div>}
+            {d.status === 'pending' ? (
+              <div className="card" style={{ marginTop: 0 }}>
+                <h3>审核出账</h3>
+                <div className="field">
+                  <label>按责任裁决冲正重算（证据充分时选择；与已关闭申诉终裁一致）</label>
+                  <select value={ruling} onChange={(e) => setRuling(e.target.value)}>
+                    <option value="">不改变裁决（按系统核定/酌情补偿）</option>
+                    <option value="stranger">陌生车主责任（全免+平台兜底+追缴）</option>
+                    <option value="owner_fault">业主责任（按实际占用+业主补偿）</option>
+                    <option value="platform_fault">平台责任（全免+赔付券）</option>
+                    <option value="property_fault">物业责任（全免+赔付券）</option>
+                    <option value="mixed">混合责任</option>
+                    <option value="no_fault">无责/证据不足</option>
+                  </select>
+                </div>
+                <div className="form-row">
+                  <div className="field"><label>酌情现金补偿（元，裁决不变时）</label>
+                    <input type="number" step="0.5" value={forceCash} onChange={(e) => setForceCash(e.target.value === '' ? '' : Number(e.target.value))} /></div>
+                  <div className="field"><label>酌情补发赔付券（元）</label>
+                    <input type="number" step="0.5" value={forceCoupon} onChange={(e) => setForceCoupon(e.target.value === '' ? '' : Number(e.target.value))} /></div>
+                </div>
+                <div className="field"><label>审核说明</label>
+                  <textarea value={note} onChange={(e) => setNote(e.target.value)} placeholder="说明采信的道闸/巡查/离场时间证据" /></div>
+                <div className="btn-row">
+                  <button className="btn success" onClick={approve}>核准并生成冲正单</button>
+                  <button className="btn danger" onClick={reject}>驳回</button>
+                </div>
+                <div className="small muted" style={{ marginTop: 8 }}>
+                  核准后原分账不删除：系统写入成对红字冲正流水并按裁决重做一版分账，借贷必须平衡否则事务回滚；同一申请只能出账一次。
+                </div>
+              </div>
+            ) : (
+              <div className="card" style={{ marginTop: 0 }}>
+                <h3>处理结果</h3>
+                <Tag status={d.status} />
+                {d.reversal_code && <div className="alert ok" style={{ marginTop: 10 }}>冲正单 {d.reversal_code} 已生成，与原分账关联可追溯</div>}
+                {d.reject_reason && <div className="alert error" style={{ marginTop: 10 }}>{d.reject_reason}</div>}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </Modal>
   );
 }
 

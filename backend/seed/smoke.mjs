@@ -77,7 +77,7 @@ async function main() {
     is_new_energy: true,
   });
 
-  const windows = [0, 1, 2, 3, 4, 5, 6].map((weekday) => ({ weekday, start_time: '00:00', end_time: '23:59' }));
+  const windows = [0, 1, 2, 3, 4, 5, 6].map((weekday) => ({ weekday, start_time: '00:00', end_time: '24:00' }));
   const codes = { A: `E${RUN}1`, B: `E${RUN}2`, C: `E${RUN}3`, D: `E${RUN}4` };
   async function publish(code, opts = {}) {
     return api('POST', '/spots', owner.token, {
@@ -351,7 +351,218 @@ async function main() {
   check('D 流水含平台先行赔付（追缴）记录', stD.ledger.some((l) => l.memo.includes('先行赔付')));
   check('D 流水借贷平衡', ledgerBalanced(stD.ledger));
 
-  console.log('== 7. 共同追溯：分账流水、调度总览、单订单全链路事件、巡查档案 ==');
+  console.log('== 7. 跨日分账：凌晨离场跨越两个结算日（UTC+8 日界）==');
+  // 北京时区明天 23:00（=UTC 15:00）入场，后天 01:00（=UTC 17:00）离场，恰好跨午夜
+  const bjNow = new Date(Date.now() + 8 * 3600000);
+  const crossStart = new Date(Date.UTC(bjNow.getUTCFullYear(), bjNow.getUTCMonth(), bjNow.getUTCDate() + 1, 15, 0, 0));
+  const crossMid = new Date(crossStart.getTime() + 60 * 60000); // 北京 00:00 日界
+  const crossEnd = new Date(crossStart.getTime() + 120 * 60000);
+  const day1 = new Date(crossStart.getTime() + 8 * 3600000).toISOString().slice(0, 10);
+  const day2 = new Date(crossEnd.getTime() + 8 * 3600000).toISOString().slice(0, 10);
+  const iso = (d) => d.toISOString();
+  check('跨日锚点跨越两个北京自然日', day1 !== day2 && crossMid.toISOString() === new Date(Date.UTC(crossMid.getUTCFullYear(), crossMid.getUTCMonth(), crossMid.getUTCDate(), 16, 0, 0)).toISOString());
+
+  await api('POST', '/coupons/issue', admin.token, { user_id: driver1.user.id, amount: 5, code: `CROSS${RUN}` });
+  const crossCoupons = await api('GET', '/coupons', driver1.token);
+  const crossCoupon = crossCoupons.find((c) => !c.used_at && c.code === `CROSS${RUN}`);
+
+  const spotE = await publish(`E${RUN}5`);
+  await api('POST', `/spots/${spotE.id}/review`, prop.token, { pass: true, remark: '跨日分账演示车位' });
+  const reserveE = await api('POST', '/reservations', driver1.token, {
+    spot_id: spotE.id, vehicle_id: neCar.id,
+    start_at: iso(crossStart), end_at: iso(crossEnd), coupon_id: crossCoupon.id,
+  });
+  check('E 跨日订单 2 小时费用 10 元、5 元券后预付 5 元', Number(reserveE.estimated_fee) === 10 && reserveE.prepaid === 5);
+  await api('POST', '/operations/gate/admit', prop.token, {
+    reservation_id: reserveE.id, plate: neCar.plate, gate: '北门入口', mode: 'manual',
+    note: '凌晨车辆，物业人工放行', entry_at: iso(crossStart),
+  });
+  await api('POST', `/operations/reservations/${reserveE.id}/parked`, driver1.token, {
+    actual_spot_code: spotE.code /* code 字段为发布时的 E...5 */, parked_at: iso(crossStart),
+  });
+  const stE = await api('POST', `/reservations/${reserveE.id}/exit`, driver1.token, { exit_at: iso(crossEnd) });
+  check('E 结算单含两个跨日分段', stE.splits.length === 2, stE.splits?.map((s) => s.settlement_date));
+  check('E 分段结算日为相邻两个北京自然日', stE.splits[0].settlement_date === day1 && stE.splits[1].settlement_date === day2);
+  check('E 各段 60 分钟，基础费 5+5=10', stE.splits[0].duration_minutes === 60 && stE.splits[1].duration_minutes === 60
+    && Number(stE.splits[0].base_fee) + Number(stE.splits[1].base_fee) === 10);
+  const sumE = (k) => stE.splits.reduce((a, s) => a + Number(s[k]), 0);
+  check('E 分段业主收益合计=结算单业主收益（3.5+3.5=7）', Math.abs(sumE('owner_income') - Number(stE.owner_income)) <= 0.01, `${sumE('owner_income')} vs ${stE.owner_income}`);
+  check('E 分段物业服务费合计=结算单（0.5+0.5=1）', Math.abs(sumE('property_fee') - Number(stE.property_fee)) <= 0.01);
+  check('E 分段平台抽成合计=结算单（1+1=2）', Math.abs(sumE('platform_fee') - Number(stE.platform_fee)) <= 0.01);
+  check('E 优惠券按各日服务费占比拆到两段（2.5+2.5=5）', Math.abs(sumE('coupon_discount') - 5) <= 0.01);
+  check('E 第一段费用来源标注物业人工放行', stE.splits[0].sources.some((x) => x.kind === 'manual_release'), JSON.stringify(stE.splits[0].sources));
+  check('E 每段都含三方分成来源说明', stE.splits.every((s) => s.sources.some((x) => x.kind === 'share')));
+  check('E 结算单流水借贷平衡', ledgerBalanced(stE.ledger));
+
+  console.log('== 8. 跨日换位（错停）：违约金与补偿按错停发生日入账 ==');
+  const spotE3 = await publish(`E${RUN}6`);
+  await api('POST', `/spots/${spotE3.id}/review`, prop.token, { pass: true, remark: '跨日换位演示' });
+  const reserveE3 = await api('POST', '/reservations', driver2.token, {
+    spot_id: spotE3.id, vehicle_id: ne2.id, start_at: iso(crossStart), end_at: iso(crossEnd),
+  });
+  await api('POST', '/operations/gate/admit', prop.token, {
+    reservation_id: reserveE3.id, plate: ne2.plate, gate: '南门入口', mode: 'auto', entry_at: iso(crossStart),
+  });
+  const parkedE3 = await api('POST', `/operations/reservations/${reserveE3.id}/parked`, driver2.token, {
+    actual_spot_code: `E${RUN}9`, note: '凌晨光线暗停错区域', parked_at: new Date(crossStart.getTime() + 30 * 60000).toISOString(),
+  });
+  check('E3 凌晨 23:30 停错车位被识别', parkedE3.wrong_parking === true);
+  const appealE3 = await api('POST', '/appeals', driver2.token, { reservation_id: reserveE3.id, reason: '凌晨地库灯光昏暗误停' });
+  await api('POST', `/appeals/${appealE3.appeal.id}/rule`, prop.token, { ruling: 'driver_fault', note: '停放核验证据充分' });
+  const stE3 = await api('POST', `/reservations/${reserveE3.id}/exit`, driver2.token, { exit_at: iso(crossEnd) });
+  check('E3 错停违约金 50 元全部归到第一结算日（23:30 发生）', Number(stE3.splits[0].wrong_park_fine) === 50 && Number(stE3.splits[1].wrong_park_fine) === 0);
+  check('E3 第一分段费用来源说明换位事实（含实际车位）', stE3.splits[0].sources.some((x) => x.kind === 'spot_change' && x.label.includes(`E${RUN}9`)));
+  check('E3 分段各项合计与结算单一致', Math.abs(stE3.splits.reduce((a, s) => a + Number(s.owner_income), 0) - Number(stE3.owner_income)) <= 0.01
+    && Math.abs(stE3.splits.reduce((a, s) => a + Number(s.platform_fee), 0) - Number(stE3.platform_fee)) <= 0.01);
+
+  console.log('== 9. 退款校验：道闸/巡查/离场时间核定 + 防重复冲销 ==');
+  // 9.1 未入场退款：预约未使用，审核通过直接取消并释放（无资金流水）
+  const spotG = await publish(`E${RUN}7`);
+  await api('POST', `/spots/${spotG.id}/review`, prop.token, { pass: true, remark: '未入场退款演示' });
+  const reserveG = await api('POST', '/reservations', driver1.token, {
+    spot_id: spotG.id, vehicle_id: neCar.id, start_at: at(360), end_at: at(420),
+  });
+  const rfG0 = await api('POST', `/reservations/${reserveG.id}/refunds`, driver1.token, { reason: '行程取消，尚未入场' });
+  check('未入场申请退款：核定可退预付（取消释放，不产生冲账）', rfG0.validation.decision === 'eligible' && Number(rfG0.refund.validated_amount) === 5, rfG0.validation);
+  const rfGApprove = await api('POST', `/refunds/${rfG0.refund.id}/approve`, prop.token, { note: '未入场，取消预约' });
+  check('未入场退款审核：订单取消、预付不冲账', rfGApprove.outcome === 'cancelled_no_settlement');
+  const detailG = await api('GET', `/reservations/${reserveG.id}`, driver1.token);
+  check('G 订单状态已取消', detailG.status === 'cancelled');
+
+  // 9.2 已结算正常单申请退款：无责任证据 -> 核定 0；物业平台酌情补偿走纯退款冲正
+  const spotH = await publish(`E${RUN}8`);
+  await api('POST', `/spots/${spotH.id}/review`, prop.token, { pass: true, remark: '酌情补偿演示' });
+  const reserveH = await api('POST', '/reservations', driver1.token, {
+    spot_id: spotH.id, vehicle_id: neCar.id, start_at: at(360), end_at: at(420),
+  });
+  await api('POST', '/operations/gate/admit', prop.token, {
+    reservation_id: reserveH.id, plate: neCar.plate, gate: '南门入口', mode: 'auto', entry_at: at(360),
+  });
+  await api('POST', `/operations/reservations/${reserveH.id}/parked`, driver1.token, {
+    actual_spot_code: `E${RUN}8`, parked_at: at(360),
+  });
+  const stH = await api('POST', `/reservations/${reserveH.id}/exit`, driver1.token, { exit_at: at(420) });
+  const rfH0 = await api('POST', `/reservations/${reserveH.id}/refunds`, driver1.token, { reason: '出场缴费机卡顿，体验不佳申请部分退款' });
+  check('正常结算单无责任证据：核定可退 0（道闸/离场时间一致）', rfH0.validation.decision === 'ineligible' && Number(rfH0.refund.validated_amount) === 0);
+  check('退款校验含道闸入场、离场、离场时间三类核验', ['gate_entry', 'gate_exit', 'exit_time'].every((k) => rfH0.validation.checks.some((c) => c.key === k)));
+  const rfHApprove = await api('POST', `/refunds/${rfH0.refund.id}/approve`, prop.token, {
+    note: '缴费机故障属实，平台补偿现金 3 元 + 赔付券 2 元', force_cash: 3, force_coupon: 2,
+  });
+  check('平台酌情补偿通过并生成退款冲正单', rfHApprove.reversal?.code?.startsWith('RV') && Number(rfHApprove.reversal.refund_to_driver) === 3 && Number(rfHApprove.reversal.coupon_reissue) === 2);
+  const detailH = await api('GET', `/reservations/${reserveH.id}/settlement`, driver1.token);
+  const revEntriesH = detailH.ledger.filter((l) => l.reversal_id);
+  const revDebitH = revEntriesH.filter((l) => l.direction === 'debit').reduce((a, l) => a + Number(l.amount), 0);
+  const revCreditH = revEntriesH.filter((l) => l.direction === 'credit').reduce((a, l) => a + Number(l.amount), 0);
+  check('H 冲正红字流水成对（平台现金借/车主贷 + 平台券出资借/券池贷），借贷平衡',
+    revEntriesH.some((l) => l.account === 'driver' && l.direction === 'credit' && Number(l.amount) === 3)
+    && revEntriesH.some((l) => l.account === 'platform' && l.direction === 'debit' && Number(l.amount) === 3)
+    && revEntriesH.some((l) => l.account === 'platform' && l.direction === 'debit' && Number(l.amount) === 2)
+    && revEntriesH.some((l) => l.account === 'coupon_pool' && l.direction === 'credit' && Number(l.amount) === 2)
+    && Math.abs(revDebitH - revCreditH) <= 0.01,
+    revEntriesH);
+  const couponH = await api('GET', '/coupons', driver1.token);
+  check('H 赔付券已发放至车主账户', couponH.some((c) => Number(c.amount) === 2 && !c.used_at));
+
+  // 9.3 重复申请/重复冲销拦截
+  const rfHDup = await api('POST', `/reservations/${reserveH.id}/refunds`, driver1.token, { reason: '再次申请' });
+  check('已处理订单再次申请时系统进行重复申请校验（记录在案）', ['duplicate', 'ineligible'].includes(rfHDup.validation.decision));
+
+  console.log('== 10. 结算后申诉成立：陌生车场景退款触发冲正单并关联原分账 ==');
+  const spotF = await publish(`E${RUN}9`);
+  await api('POST', `/spots/${spotF.id}/review`, prop.token, { pass: true, remark: '退款冲正演示' });
+  const reserveF = await api('POST', '/reservations', driver1.token, {
+    spot_id: spotF.id, vehicle_id: neCar.id, start_at: at(360), end_at: at(480),
+  });
+  // 巡查发现陌生车占用（车主未入场），30 分钟后驶离；离场时无终裁 -> 先按正常结算
+  const patrolF = await api('POST', '/operations/patrol', prop.token, {
+    spot_id: spotF.id, plate: '沪X88888', finding: 'stranger',
+    note: '夜间巡查发现陌生车占用预约位', patrolled_at: at(360),
+  });
+  await api('POST', `/dispatch/incidents/${patrolF.ticket_id}/resolve`, prop.token, { resolution: '陌生车驶离', resolved_at: at(390) });
+  const stF0 = await api('POST', `/reservations/${reserveF.id}/exit`, driver1.token, { exit_at: at(480) });
+  check('F 无终裁先按实际占用结算（90 分钟，预付有退差）', Number(stF0.base_fee) === 7.5 && Number(stF0.refund) === 2.5, `${stF0.base_fee}/${stF0.refund}`);
+  const rfF0 = await api('POST', `/reservations/${reserveF.id}/refunds`, driver1.token, { reason: '到场车位被陌生车占用，申请退款' });
+  check('F 退款校验采纳巡查证据并给出 stranger 责任建议', rfF0.validation.suggestedRuling === 'stranger'
+    && rfF0.validation.checks.some((c) => c.key === 'patrol' && c.detail.includes('陌生')));
+  check('F 无终裁前不直接核定现金（避免错误冲销）', Number(rfF0.refund.validated_amount) === 0 && rfF0.refund.status === 'pending');
+  // 物业依证据核准：按 stranger 责任冲正重算
+  const rfFApprove = await api('POST', `/refunds/${rfF0.refund.id}/approve`, prop.token, {
+    ruling: 'stranger', note: '巡查照片与车牌证据成立，平台兜底，向陌生车主追缴',
+  });
+  check('F 核准生成冲正单并关联原分账', rfFApprove.reversal?.kind === 'refund_approved' && Number(rfFApprove.reversal.settlement_id) === Number(stF0.id), rfFApprove.reversal);
+  // 原分账车主净付 7.5；stranger 重算后应付 0 且应收 20 现金补偿 -> 补退 27.5
+  check('F 冲正补退车主现金 27.5 元（原净付 7.5 + 平台先行补偿 20）', Math.abs(Number(rfFApprove.reversal.refund_to_driver) - 27.5) <= 0.01, rfFApprove.reversal.refund_to_driver);
+
+  const detailF = await api('GET', `/reservations/${reserveF.id}/settlement`, driver1.token);
+  check('F 当前生效分账为重做版（kind=recomputed，指向上一版）', detailF.kind === 'recomputed' && Number(detailF.supersedes_id) === Number(stF0.id), `${detailF.kind}/${detailF.supersedes_id}/${stF0.id}`);
+  check('F 重做版按 stranger 全免（服务费 0、平台先行赔付）', Number(detailF.base_fee) === 0 && Number(detailF.owner_compensation) === 30);
+  check('F 结算查询返回两个版本与冲正单', detailF.versions.length === 2 && detailF.reversals.length === 1);
+  const oldLedgerViaLedger = await api('GET', `/ledger?account=escrow`, prop.token);
+  const redEntries = oldLedgerViaLedger.filter((l) => l.settlement_code === stF0.code && l.reversal_code);
+  check('F 原分账保留且挂成对红字冲正流水（摘要含冲正单号）', redEntries.length >= 2 && redEntries.every((l) => /冲正 RV/.test(l.memo)), redEntries.map((l) => l.memo));
+  check('F 冲正单与原结算单绑定可追溯（流水带 reversal_code）', redEntries.every((l) => !!l.reversal_code));
+
+  // 重复冲销防护：退款单已 paid，再次审核必须拒绝
+  let secondApproveErr = '';
+  try {
+    await api('POST', `/refunds/${rfF0.refund.id}/approve`, prop.token, {});
+  } catch (e) {
+    secondApproveErr = e.message;
+  }
+  check('F 已出账退款单再次审核被拒绝（防重复冲销）', /已处理|重复/.test(secondApproveErr), secondApproveErr);
+
+  // 车主侧退款列表
+  const myRefunds = await api('GET', '/refunds', driver1.token);
+  check('车主可查退款申请状态（paid/pending/cancelled 场景齐全）', myRefunds.some((x) => x.status === 'paid' && x.reversal_code?.startsWith('RV')));
+
+  console.log('== 10b. 财务结算后申诉成立：resettle 生成申诉冲正单（先结算后终裁）==');
+  const spotI = await publish(`E${RUN}10`);
+  await api('POST', `/spots/${spotI.id}/review`, prop.token, { pass: true, remark: '结算后申诉冲正演示' });
+  const reserveI = await api('POST', '/reservations', driver1.token, {
+    spot_id: spotI.id, vehicle_id: neCar.id, start_at: at(360), end_at: at(420),
+  });
+  await api('POST', '/operations/gate/admit', prop.token, {
+    reservation_id: reserveI.id, plate: neCar.plate, gate: '南门入口', mode: 'auto', entry_at: at(360),
+  });
+  await api('POST', `/operations/reservations/${reserveI.id}/parked`, driver1.token, {
+    actual_spot_code: `E${RUN}10`, parked_at: at(360),
+  });
+  const stI0 = await api('POST', `/reservations/${reserveI.id}/exit`, driver1.token, { exit_at: at(420) });
+  check('I 先按正常单结算（1 小时 5 元，无退款）', Number(stI0.base_fee) === 5 && Number(stI0.refund) === 0);
+  const appealI = await api('POST', '/appeals', driver1.token, {
+    reservation_id: reserveI.id,
+    reason: '地库导航全程无信号被引到错误区域，平台服务瑕疵',
+    evidence: [{ source: 'signal', title: '信号记录', content: '弱信号上报，使用离线导航', captured_at: at(365), stance: 'support' }],
+  });
+  await api('POST', `/appeals/${appealI.appeal.id}/rule`, prop.token, {
+    ruling: 'platform_fault', note: '信号服务瑕疵成立，费用全免并发赔付券',
+  });
+  const rsI = await api('POST', `/appeals/${appealI.appeal.id}/resettle`, prop.token);
+  check('I 终裁后生成申诉冲正单（kind=appeal_ruling，关联申诉与原分账）',
+    rsI.reversal?.kind === 'appeal_ruling' && Number(rsI.reversal.appeal_id) === Number(appealI.appeal.id)
+    && Number(rsI.reversal.settlement_id) === Number(stI0.id), rsI.reversal);
+  check('I 冲正补退预付 5 元并补发 15 元赔付券',
+    Math.abs(Number(rsI.reversal.refund_to_driver) - 5) <= 0.01 && Number(rsI.reversal.coupon_reissue) === 15,
+    rsI.reversal);
+  const detailI = await api('GET', `/reservations/${reserveI.id}/settlement`, driver1.token);
+  check('I 当前生效为重做版：服务费全免（base=0）', detailI.kind === 'recomputed' && Number(detailI.base_fee) === 0);
+  check('I 结算查询包含两版分账与一张申诉冲正单', detailI.versions.length === 2 && detailI.reversals.length === 1
+    && detailI.reversals[0].appeal_id === String(appealI.appeal.id), detailI.reversals);
+  const ledgerI = await api('GET', `/ledger?account=escrow`, prop.token);
+  const oldRowsI = ledgerI.filter((l) => l.settlement_code === stI0.code);
+  const redRowsI = oldRowsI.filter((l) => l.reversal_code);
+  check('I 原分账每条托管流水都有对应红字冲正（反向成对、笔数相等）',
+    redRowsI.length >= 2 && redRowsI.length === oldRowsI.length - redRowsI.length,
+    { red: redRowsI.length, total: oldRowsI.length });
+  const couponsI = await api('GET', '/coupons', driver1.token);
+  check('I 15 元赔付券已入账', couponsI.some((c) => Number(c.amount) === 15 && !c.used_at));
+  // 再次 resettle 必须幂等，不产生第二张冲正单
+  const rsI2 = await api('POST', `/appeals/${appealI.appeal.id}/resettle`, prop.token);
+  check('I 同一终裁重复 resettle 幂等返回，不再冲销', rsI2.idempotent === true);
+  const detailI2 = await api('GET', `/reservations/${reserveI.id}/settlement`, driver1.token);
+  check('I 冲正单仍只有一张（防重复冲销）', detailI2.reversals.length === 1);
+
+  console.log('== 11. 共同追溯：分账流水、调度总览、单订单全链路事件、巡查档案 ==');
   const ledger = await api('GET', '/ledger', prop.token);
   check(
     '分账流水覆盖车主/业主/物业/平台/券池/托管账户',
